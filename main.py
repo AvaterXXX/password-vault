@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+import threading
 import time
 import webbrowser
 from pathlib import Path
@@ -11,8 +12,9 @@ from typing import Any
 
 import customtkinter as ctk
 import pyotp
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
+from importer import FORMAT_HELP, detect_and_parse
 from storage import VaultStorage
 
 
@@ -374,6 +376,8 @@ class UnlockDialog(ctk.CTkToplevel):
         self.destroy()
 
     def _submit(self) -> None:
+        if getattr(self, "_busy", False):
+            return
         p1 = self.pw1.get()
         if self._first:
             p2 = self.pw2.get() if self.pw2 else ""
@@ -383,19 +387,29 @@ class UnlockDialog(ctk.CTkToplevel):
             if p1 != p2:
                 self.err.configure(text="两次输入的主密码不一致")
                 return
+        self._busy = True
+        self.err.configure(text="正在解锁（国密派生密钥，请稍候）…", text_color=TEXT_MUTED)
+
+        def work() -> None:
             try:
-                self.storage.setup_master_password(p1)
+                if self._first:
+                    self.storage.setup_master_password(p1)
+                else:
+                    self.storage.unlock(p1)
+                self.after(0, self._on_unlock_ok)
             except Exception as e:
-                self.err.configure(text=str(e))
-                return
-        else:
-            try:
-                self.storage.unlock(p1)
-            except Exception as e:
-                self.err.configure(text=str(e))
-                return
+                msg = str(e)
+                self.after(0, lambda: self._on_unlock_fail(msg))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_unlock_ok(self) -> None:
         self.result_ok = True
         self.destroy()
+
+    def _on_unlock_fail(self, msg: str) -> None:
+        self._busy = False
+        self.err.configure(text=msg or "解锁失败", text_color=DANGER)
 
 # 复制提示用中文名称
 FIELD_CN = {
@@ -464,15 +478,21 @@ class AccountVaultApp(ctk.CTk):
         self._site_menu_target: dict[str, Any] | None = None
         self._search_after_id: str | None = None
         self._list_version = 0
+        self._last_totp_ui: tuple[str, str] = ("", "")
+        self._filling_form = False
+        self._cats_cache: list[str] | None = None
 
         self._build_ui()
         self._build_site_context_menu()
+        # 延后首屏刷新，先显示窗口骨架，减少“卡住”感
+        self.after(10, self._bootstrap_ui)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _bootstrap_ui(self) -> None:
         self.refresh_sites()
         self.refresh_accounts()
         self._tick_totp()
         self._update_crypto_label()
-
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- 界面 ----------------
     def _build_ui(self) -> None:
@@ -514,6 +534,17 @@ class AccountVaultApp(ctk.CTk):
 
         ctk.CTkButton(
             top,
+            text="批量导入",
+            width=90,
+            height=36,
+            fg_color="#EEF2FF",
+            hover_color="#DBEAFE",
+            text_color=PRIMARY,
+            command=self._import_dialog,
+        ).grid(row=0, column=2, sticky="e", padx=(0, 8))
+
+        ctk.CTkButton(
+            top,
             text="修改主密码",
             width=100,
             height=36,
@@ -521,17 +552,17 @@ class AccountVaultApp(ctk.CTk):
             hover_color="#D1D5DB",
             text_color=TEXT,
             command=self._change_master_password_dialog,
-        ).grid(row=0, column=2, sticky="e", padx=(0, 8))
+        ).grid(row=0, column=3, sticky="e", padx=(0, 8))
 
         ctk.CTkButton(
             top,
             text="+ 新建账户",
-            width=120,
+            width=110,
             height=36,
             fg_color=PRIMARY,
             hover_color=PRIMARY_HOVER,
             command=self._new_account,
-        ).grid(row=0, column=3, sticky="e")
+        ).grid(row=0, column=4, sticky="e")
 
         # ---- 左：账户列表 ----
         left = ctk.CTkFrame(root, fg_color=BG_SOFT, corner_radius=12, border_width=1, border_color=BORDER)
@@ -972,7 +1003,9 @@ class AccountVaultApp(ctk.CTk):
 
     def refresh_accounts(self) -> None:
         self._list_version += 1
-        cats = ["全部"] + self.storage.categories()
+        form_cats = self.storage.categories()
+        self._cats_cache = form_cats
+        cats = ["全部"] + form_cats
         current = self.category_filter.get() or "全部"
         # 避免 set 触发多余刷新闪烁：仅值变化时更新
         self.category_filter.configure(values=cats)
@@ -981,7 +1014,6 @@ class AccountVaultApp(ctk.CTk):
         if self.category_filter.get() != current:
             self.category_filter.set(current)
 
-        form_cats = self.storage.categories()
         self.fields["category"].configure(values=form_cats)  # type: ignore[union-attr]
 
         for w in self.account_list.winfo_children():
@@ -1061,27 +1093,49 @@ class AccountVaultApp(ctk.CTk):
         if not acc:
             self._clear_form()
             return
-        self._entry_set("title", acc.get("title", ""))
-        self._entry_set("category", acc.get("category", "其他"))
-        self._entry_set("username", acc.get("username", ""))
-        self._entry_set("password", acc.get("password", ""))
-        self._entry_set("totp_secret", acc.get("totp_secret", ""))
-        self._entry_set("website", acc.get("website", ""))
-        self._entry_set("notes", acc.get("notes", ""))
-        self._show_password = False
-        pw = self.fields["password"]
-        if isinstance(pw, ctk.CTkEntry):
-            pw.configure(show="•")
+        self._filling_form = True
+        try:
+            # 仅当值变化时写入，减少控件重绘“闪一下”
+            pairs = [
+                ("title", acc.get("title", "")),
+                ("category", acc.get("category", "其他") or "其他"),
+                ("username", acc.get("username", "")),
+                ("password", acc.get("password", "")),
+                ("totp_secret", acc.get("totp_secret", "")),
+                ("website", acc.get("website", "")),
+                ("notes", acc.get("notes", "")),
+            ]
+            for key, val in pairs:
+                cur = self._entry_get(key) if key != "notes" else self.fields["notes"].get("1.0", "end").strip()  # type: ignore[union-attr]
+                if cur != (val or ""):
+                    self._entry_set(key, val or "")
+            self._show_password = False
+            pw = self.fields["password"]
+            if isinstance(pw, ctk.CTkEntry) and pw.cget("show") != "•":
+                pw.configure(show="•")
+        finally:
+            self._filling_form = False
+            self._last_totp_ui = ("", "")
+            self._refresh_totp_display()
 
     def _clear_form(self) -> None:
         self.selected_id = None
-        for key in ("title", "username", "password", "totp_secret", "website"):
-            self._entry_set(key, "")
-        self._entry_set("category", "其他")
-        self._entry_set("notes", "")
+        self._filling_form = True
+        try:
+            for key in ("title", "username", "password", "totp_secret", "website"):
+                if self._entry_get(key):
+                    self._entry_set(key, "")
+            if self._entry_get("category") != "其他":
+                self._entry_set("category", "其他")
+            notes_w = self.fields["notes"]
+            if isinstance(notes_w, ctk.CTkTextbox) and notes_w.get("1.0", "end").strip():
+                self._entry_set("notes", "")
+        finally:
+            self._filling_form = False
         self.status_label.configure(text="新建模式")
-        # 只改高亮，不整表重建
         self._update_list_selection()
+        self._last_totp_ui = ("", "")
+        self._refresh_totp_display()
 
     def _new_account(self) -> None:
         self._clear_form()
@@ -1092,14 +1146,17 @@ class AccountVaultApp(ctk.CTk):
     def _select_account(self, account_id: str) -> None:
         if account_id == self.selected_id:
             return
+        # 先更新选中高亮（即时反馈），再填详情
+        prev = self.selected_id
+        self.selected_id = account_id
+        self._update_list_selection()
         acc = self.storage.get_account(account_id)
         if not acc:
+            self.selected_id = prev
+            self._update_list_selection()
             return
-        self.selected_id = account_id
         self._fill_form(acc)
         self.status_label.configure(text=f"已加载：{acc['title']}")
-        # 关键：不再 refresh_accounts 整表销毁重建
-        self._update_list_selection()
 
     def _save_account(self) -> None:
         data = self._get_form_data()
@@ -1113,7 +1170,9 @@ class AccountVaultApp(ctk.CTk):
             acc = self.storage.add_account(data)
             self.selected_id = acc["id"]
             self.status_label.configure(text="已新增")
-        self.fields["category"].configure(values=self.storage.categories())  # type: ignore[union-attr]
+        self._cats_cache = None
+        cats = self.storage.categories()
+        self.fields["category"].configure(values=cats)  # type: ignore[union-attr]
         # 保存后标题/副标题可能变，需要重建列表
         self.refresh_accounts()
 
@@ -1170,22 +1229,31 @@ class AccountVaultApp(ctk.CTk):
         webbrowser.open(url)
 
     def _refresh_totp_display(self) -> None:
+        if self._filling_form:
+            return
         raw = self._entry_get("totp_secret")
         code, remain = totp_code(raw)
         if not (raw or "").strip():
-            self.totp_code_label.configure(text="—— ——", text_color=PRIMARY)
-            self.totp_remain_label.configure(text="等待输入密钥")
+            state = ("—— ——", "等待输入密钥")
+            color = PRIMARY
         elif code == "无效密钥":
-            self.totp_code_label.configure(text="密钥无效", text_color=DANGER)
-            self.totp_remain_label.configure(text="请检查密钥格式")
+            state = ("密钥无效", "请检查密钥格式")
+            color = DANGER
         else:
             pretty = f"{code[:3]} {code[3:]}" if len(code) == 6 else code
-            self.totp_code_label.configure(text=pretty, text_color=PRIMARY)
-            self.totp_remain_label.configure(text=f"剩余 {remain} 秒 · 自动刷新")
+            state = (pretty, f"剩余 {remain} 秒 · 自动刷新")
+            color = PRIMARY
+        if state == self._last_totp_ui:
+            return
+        self._last_totp_ui = state
+        self.totp_code_label.configure(text=state[0], text_color=color)
+        self.totp_remain_label.configure(text=state[1])
 
     def _tick_totp(self) -> None:
         self._refresh_totp_display()
-        self.after(500, self._tick_totp)
+        # 有密钥时 1s 刷新；无密钥时 2s，降低空转开销
+        has_secret = bool(self._entry_get("totp_secret").strip())
+        self.after(1000 if has_secret else 2000, self._tick_totp)
 
     # ---------------- 网站弹窗 ----------------
     def _add_site_dialog(self) -> None:
@@ -1225,6 +1293,148 @@ class AccountVaultApp(ctk.CTk):
     def _update_crypto_label(self) -> None:
         if hasattr(self, "crypto_label"):
             self.crypto_label.configure(text=self.storage.crypto_info())
+
+    def _import_dialog(self) -> None:
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("批量导入账户")
+        dlg.geometry("720x560")
+        dlg.configure(fg_color=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+        apply_window_icon(dlg)
+
+        ctk.CTkLabel(
+            dlg,
+            text="批量导入",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=TEXT,
+        ).pack(anchor="w", padx=20, pady=(16, 4))
+        ctk.CTkLabel(
+            dlg,
+            text="粘贴文本或选择文件；支持 JSON / CSV / GPT账号 / SSH / RDP / 文本块，可自动识别",
+            text_color=TEXT_MUTED,
+            wraplength=660,
+            justify="left",
+        ).pack(anchor="w", padx=20, pady=(0, 8))
+
+        bar = ctk.CTkFrame(dlg, fg_color="transparent")
+        bar.pack(fill="x", padx=20, pady=(0, 6))
+        fmt_var = ctk.StringVar(value="auto")
+        ctk.CTkLabel(bar, text="格式", text_color=TEXT_MUTED).pack(side="left")
+        fmt_box = make_combo(
+            bar,
+            values=["auto", "json", "csv", "gpt", "web", "ssh", "rdp", "block"],
+            soft=True,
+        )
+        fmt_box.set("auto")
+        fmt_box.pack(side="left", padx=(8, 12))
+        status = ctk.CTkLabel(bar, text="", text_color=TEXT_MUTED)
+        status.pack(side="left", fill="x", expand=True)
+
+        text = ctk.CTkTextbox(
+            dlg,
+            fg_color=BG_SOFT,
+            border_width=1,
+            border_color=BORDER,
+            text_color=TEXT,
+            height=280,
+        )
+        text.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        text.insert("1.0", FORMAT_HELP)
+
+        def load_file() -> None:
+            path = filedialog.askopenfilename(
+                parent=dlg,
+                title="选择导入文件",
+                filetypes=[
+                    ("文本/表格", "*.txt;*.csv;*.tsv;*.json;*.log"),
+                    ("全部文件", "*.*"),
+                ],
+            )
+            if not path:
+                return
+            raw = Path(path).read_bytes()
+            for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030", "latin-1"):
+                try:
+                    content = raw.decode(enc)
+                    break
+                except Exception:
+                    content = None
+            if content is None:
+                messagebox.showerror("错误", "无法解码文件", parent=dlg)
+                return
+            text.delete("1.0", "end")
+            text.insert("1.0", content)
+            status.configure(text=f"已载入：{Path(path).name}")
+
+        def do_preview() -> tuple[str, list[dict[str, Any]]]:
+            body = text.get("1.0", "end").strip()
+            # 若还是帮助文案，不导入
+            if body.startswith("支持格式"):
+                return ("", [])
+            name, items = detect_and_parse(body, force_format=fmt_box.get() or "auto")
+            return name, items
+
+        def preview() -> None:
+            name, items = do_preview()
+            if not items:
+                status.configure(text="未解析到账户，请检查格式")
+                return
+            status.configure(text=f"识别为「{name}」，共 {len(items)} 条（预览未写入）")
+
+        def do_import() -> None:
+            name, items = do_preview()
+            if not items:
+                messagebox.showwarning("提示", "未解析到可导入账户", parent=dlg)
+                return
+            if not pretty_confirm(
+                dlg,
+                "确认导入",
+                f"识别格式：{name}\n将导入 {len(items)} 条账户，是否继续？",
+            ):
+                return
+            status.configure(text="正在加密写入…")
+            dlg.update_idletasks()
+
+            def work() -> None:
+                try:
+                    n = self.storage.add_accounts_batch(items)
+                    self.after(0, lambda: done(n, name))
+                except Exception as e:
+                    msg = str(e)
+                    self.after(0, lambda: fail(msg))
+
+            def done(n: int, fmt_name: str) -> None:
+                self._cats_cache = None
+                self.refresh_accounts()
+                status.configure(text=f"已导入 {n} 条（{fmt_name}）")
+                self.status_label.configure(text=f"批量导入 {n} 条")
+                messagebox.showinfo("完成", f"成功导入 {n} 条账户", parent=dlg)
+
+            def fail(msg: str) -> None:
+                status.configure(text=f"导入失败：{msg}")
+                messagebox.showerror("失败", msg, parent=dlg)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        btns = ctk.CTkFrame(dlg, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=(0, 16))
+        ctk.CTkButton(
+            btns, text="选择文件", width=100, fg_color="#E5E7EB", hover_color="#D1D5DB",
+            text_color=TEXT, command=load_file,
+        ).pack(side="left")
+        ctk.CTkButton(
+            btns, text="预览解析", width=100, fg_color="#EEF2FF", hover_color="#DBEAFE",
+            text_color=PRIMARY, command=preview,
+        ).pack(side="left", padx=8)
+        ctk.CTkButton(
+            btns, text="开始导入", width=120, fg_color=SUCCESS, hover_color="#047857",
+            command=do_import,
+        ).pack(side="right")
+        ctk.CTkButton(
+            btns, text="关闭", width=80, fg_color="#E5E7EB", hover_color="#D1D5DB",
+            text_color=TEXT, command=dlg.destroy,
+        ).pack(side="right", padx=(0, 8))
 
     def _change_master_password_dialog(self) -> None:
         dlg = ctk.CTkToplevel(self)

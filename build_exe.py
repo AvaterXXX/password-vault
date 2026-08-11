@@ -39,6 +39,8 @@ def main() -> int:
         "--hidden-import",
         "crypto_gm",
         "--hidden-import",
+        "importer",
+        "--hidden-import",
         "pyotp",
         "--hidden-import",
         "gmssl",

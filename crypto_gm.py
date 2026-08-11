@@ -18,8 +18,9 @@ from gmssl import func, sm3
 from gmssl.sm4 import CryptSM4, SM4_DECRYPT, SM4_ENCRYPT
 
 CIPHER_PREFIX = "GM1:"  # SM3-KDF + SM4-CBC
-# 纯 Python SM3 约 3000 次/秒；8000 次解锁约 2–3 秒，兼顾强度与体验
-KDF_ITERATIONS = 8_000
+# 纯 Python SM3 较慢；4000 次约 1 秒出头，兼顾强度与启动体验
+# 已建库仍使用库内保存的 kdf_iterations，不受此默认值影响
+KDF_ITERATIONS = 4_000
 
 
 def _sm3_hex(data: bytes) -> str:

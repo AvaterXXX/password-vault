@@ -44,7 +44,8 @@ class VaultStorage:
         self.db_path = db_path or (self.data_dir / "vault.db")
         self.key_path = self.data_dir / "vault.key"  # 旧版 Fernet 密钥，迁移后删除
         self._sm4_key: Optional[bytes] = None
-        self._conn = sqlite3.connect(self.db_path)
+        self._account_cache: dict[str, dict[str, Any]] = {}
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_db()
 
@@ -125,6 +126,7 @@ class VaultStorage:
         self._meta_set("crypto_version", "1")
 
         self._sm4_key = key
+        self._account_cache.clear()
         # 迁移旧 Fernet 数据（若有）
         self._migrate_legacy_if_needed()
 
@@ -137,6 +139,7 @@ class VaultStorage:
         salt = base64.b64decode(salt_b64.encode("ascii"))
         # 一次派生完成校验 + 得到密钥
         self._sm4_key = unlock_with_password(master_password, salt, verifier, iterations)
+        self._account_cache.clear()
         self._migrate_legacy_if_needed()
 
     def change_master_password(self, old_password: str, new_password: str) -> None:
@@ -185,11 +188,18 @@ class VaultStorage:
 
     def lock(self) -> None:
         self._sm4_key = None
+        self._account_cache.clear()
 
     def _require_unlock(self) -> bytes:
         if self._sm4_key is None:
             raise VaultLockedError("保险库未解锁")
         return self._sm4_key
+
+    def invalidate_cache(self, account_id: str | None = None) -> None:
+        if account_id is None:
+            self._account_cache.clear()
+        else:
+            self._account_cache.pop(account_id, None)
 
     # ---------- 加解密 ----------
     def _looks_encrypted(self, value: str) -> bool:
@@ -234,6 +244,25 @@ class VaultStorage:
         """把旧 Fernet 密文重加密为国密 SM4，并删除 vault.key。"""
         key = self._require_unlock()
         legacy = self._load_legacy_fernet_key()
+        # 无旧密钥且抽样已是国密，直接跳过（加速启动）
+        if not legacy:
+            row = self._conn.execute(
+                "SELECT password_enc, notes FROM accounts LIMIT 5"
+            ).fetchall()
+            if not row or all(
+                (not r["password_enc"] or is_gm_cipher(r["password_enc"]))
+                and (not r["notes"] or is_gm_cipher(r["notes"]))
+                for r in row
+            ):
+                # 仍可能有未加密 notes；仅当存在非 GM notes 才全表扫
+                need = self._conn.execute(
+                    "SELECT 1 FROM accounts WHERE "
+                    "(password_enc != '' AND password_enc NOT LIKE 'GM1:%') OR "
+                    "(totp_secret_enc != '' AND totp_secret_enc NOT LIKE 'GM1:%') OR "
+                    "(notes != '' AND notes NOT LIKE 'GM1:%') LIMIT 1"
+                ).fetchone()
+                if not need:
+                    return
         rows = self._conn.execute(
             "SELECT id, password_enc, totp_secret_enc, notes FROM accounts"
         ).fetchall()
@@ -368,8 +397,15 @@ class VaultStorage:
 
     def get_account(self, account_id: str) -> dict[str, Any] | None:
         self._require_unlock()
+        cached = self._account_cache.get(account_id)
+        if cached is not None:
+            return dict(cached)
         row = self._conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
-        return self._row_to_account(row) if row else None
+        if not row:
+            return None
+        acc = self._row_to_account(row)
+        self._account_cache[account_id] = acc
+        return dict(acc)
 
     def _row_to_account(self, row: sqlite3.Row) -> dict[str, Any]:
         notes_raw = row["notes"] or ""
@@ -424,7 +460,44 @@ class VaultStorage:
             ),
         )
         self._conn.commit()
+        self.invalidate_cache()
         return self.get_account(account_id)  # type: ignore[return-value]
+
+    def add_accounts_batch(self, items: list[dict[str, Any]]) -> int:
+        """批量新增，单事务提交，返回成功条数。"""
+        self._require_unlock()
+        if not items:
+            return 0
+        now = self._now()
+        rows = []
+        for data in items:
+            notes = (data.get("notes") or "").strip()
+            rows.append(
+                (
+                    str(uuid.uuid4()),
+                    data.get("title", "").strip() or "未命名",
+                    data.get("category", "其他").strip() or "其他",
+                    data.get("username", "").strip(),
+                    self._enc(data.get("password", "")),
+                    self._enc(self._normalize_totp(data.get("totp_secret", ""))),
+                    data.get("website", "").strip(),
+                    self._enc(notes) if notes else "",
+                    now,
+                    now,
+                )
+            )
+        self._conn.executemany(
+            """
+            INSERT INTO accounts (
+                id, title, category, username, password_enc, totp_secret_enc,
+                website, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self._conn.commit()
+        self.invalidate_cache()
+        return len(rows)
 
     def update_account(self, account_id: str, data: dict[str, Any]) -> dict[str, Any] | None:
         self._require_unlock()
@@ -450,19 +523,21 @@ class VaultStorage:
             ),
         )
         self._conn.commit()
+        self.invalidate_cache(account_id)
         return self.get_account(account_id)
 
     def delete_account(self, account_id: str) -> None:
         self._require_unlock()
         self._conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
         self._conn.commit()
+        self.invalidate_cache(account_id)
 
     def categories(self) -> list[str]:
         rows = self._conn.execute(
             "SELECT DISTINCT category FROM accounts ORDER BY category"
         ).fetchall()
         cats = [r["category"] for r in rows if r["category"]]
-        defaults = ["人工智能", "邮箱", "社交", "工作", "开发", "其他"]
+        defaults = ["人工智能", "SSH", "RDP", "网站", "邮箱", "社交", "工作", "开发", "其他"]
         merged = []
         for c in defaults + cats:
             if c not in merged:
