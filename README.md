@@ -56,7 +56,6 @@
 ### 安装依赖
 
 ```bash
-```bash
 git clone https://github.com/AvaterXXX/password-vault.git
 cd password-vault
 pip install -r requirements.txt
@@ -68,9 +67,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-仓库地址：<https://github.com/AvaterXXX/password-vault>
-
 首次启动会要求设置 **主密码**（至少 6 位）。请牢记，丢失后本地密文无法恢复。
+
+仓库地址：https://github.com/AvaterXXX/password-vault
 
 ---
 
