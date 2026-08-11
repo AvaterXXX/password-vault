@@ -373,7 +373,10 @@ class UnlockDialog(ctk.CTkToplevel):
 
     def _cancel(self) -> None:
         self.result_ok = False
-        self.destroy()
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
     def _submit(self) -> None:
         if getattr(self, "_busy", False):
@@ -382,34 +385,48 @@ class UnlockDialog(ctk.CTkToplevel):
         if self._first:
             p2 = self.pw2.get() if self.pw2 else ""
             if len(p1) < 6:
-                self.err.configure(text="主密码至少 6 位")
+                self.err.configure(text="主密码至少 6 位", text_color=DANGER)
                 return
             if p1 != p2:
-                self.err.configure(text="两次输入的主密码不一致")
+                self.err.configure(text="两次输入的主密码不一致", text_color=DANGER)
                 return
         self._busy = True
-        self.err.configure(text="正在解锁（国密派生密钥，请稍候）…", text_color=TEXT_MUTED)
+        self._unlock_result: tuple[str, str] | None = None  # ("ok","") | ("err", msg)
+        self.err.configure(text="正在解锁（国密派生密钥，约 1～3 秒）…", text_color=TEXT_MUTED)
 
         def work() -> None:
+            # 注意：Tk 非线程安全，禁止在子线程里 self.after / 改 UI
             try:
                 if self._first:
                     self.storage.setup_master_password(p1)
                 else:
                     self.storage.unlock(p1)
-                self.after(0, self._on_unlock_ok)
+                self._unlock_result = ("ok", "")
             except Exception as e:
-                msg = str(e)
-                self.after(0, lambda: self._on_unlock_fail(msg))
+                self._unlock_result = ("err", str(e) or "解锁失败")
 
         threading.Thread(target=work, daemon=True).start()
+        self.after(50, self._poll_unlock)
 
-    def _on_unlock_ok(self) -> None:
-        self.result_ok = True
-        self.destroy()
-
-    def _on_unlock_fail(self, msg: str) -> None:
+    def _poll_unlock(self) -> None:
+        """主线程轮询后台解锁结果（兼容 Windows/Tk）。"""
+        result = getattr(self, "_unlock_result", None)
+        if result is None:
+            # 动画点点点
+            msg = self.err.cget("text") or ""
+            if "正在解锁" in msg:
+                dots = msg.count(".") % 3
+                base = "正在解锁（国密派生密钥，约 1～3 秒）"
+                self.err.configure(text=base + "." * (dots + 1), text_color=TEXT_MUTED)
+            self.after(80, self._poll_unlock)
+            return
+        status, msg = result
         self._busy = False
-        self.err.configure(text=msg or "解锁失败", text_color=DANGER)
+        if status == "ok":
+            self.result_ok = True
+            self.destroy()
+        else:
+            self.err.configure(text=msg or "主密码错误或解锁失败", text_color=DANGER)
 
 # 复制提示用中文名称
 FIELD_CN = {
@@ -1395,27 +1412,38 @@ class AccountVaultApp(ctk.CTk):
                 return
             status.configure(text="正在加密写入…")
             dlg.update_idletasks()
+            import_state: dict[str, Any] = {"done": False}
 
             def work() -> None:
                 try:
                     n = self.storage.add_accounts_batch(items)
-                    self.after(0, lambda: done(n, name))
+                    import_state["ok"] = True
+                    import_state["n"] = n
+                    import_state["name"] = name
                 except Exception as e:
-                    msg = str(e)
-                    self.after(0, lambda: fail(msg))
+                    import_state["ok"] = False
+                    import_state["err"] = str(e)
+                import_state["done"] = True
 
-            def done(n: int, fmt_name: str) -> None:
-                self._cats_cache = None
-                self.refresh_accounts()
-                status.configure(text=f"已导入 {n} 条（{fmt_name}）")
-                self.status_label.configure(text=f"批量导入 {n} 条")
-                messagebox.showinfo("完成", f"成功导入 {n} 条账户", parent=dlg)
-
-            def fail(msg: str) -> None:
-                status.configure(text=f"导入失败：{msg}")
-                messagebox.showerror("失败", msg, parent=dlg)
+            def poll() -> None:
+                if not import_state.get("done"):
+                    dlg.after(50, poll)
+                    return
+                if import_state.get("ok"):
+                    n = int(import_state.get("n") or 0)
+                    fmt_name = str(import_state.get("name") or "")
+                    self._cats_cache = None
+                    self.refresh_accounts()
+                    status.configure(text=f"已导入 {n} 条（{fmt_name}）")
+                    self.status_label.configure(text=f"批量导入 {n} 条")
+                    messagebox.showinfo("完成", f"成功导入 {n} 条账户", parent=dlg)
+                else:
+                    msg = str(import_state.get("err") or "未知错误")
+                    status.configure(text=f"导入失败：{msg}")
+                    messagebox.showerror("失败", msg, parent=dlg)
 
             threading.Thread(target=work, daemon=True).start()
+            dlg.after(50, poll)
 
         btns = ctk.CTkFrame(dlg, fg_color="transparent")
         btns.pack(fill="x", padx=20, pady=(0, 16))
