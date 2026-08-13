@@ -15,7 +15,12 @@ import pyotp
 from tkinter import filedialog, messagebox
 
 from importer import FORMAT_HELP, detect_and_parse
-from storage import VaultStorage
+from storage import VaultBusyError, VaultStorage
+
+# 安全相关默认值
+CLIPBOARD_CLEAR_MS = 45_000  # 复制密码/验证码后自动清空剪贴板
+IDLE_LOCK_MS = 5 * 60_000  # 空闲自动锁定
+MIN_MASTER_PASSWORD_LEN = 8
 
 
 def app_base_dir() -> Path:
@@ -301,9 +306,9 @@ class UnlockDialog(ctk.CTkToplevel):
         tip = (
             "主密码用于派生国密 SM4 密钥，加密本地密码与二次验证密钥。\n"
             "主密码不会保存到磁盘；忘记后无法找回密文内容。\n"
-            "请使用至少 6 位、尽量复杂的主密码。"
+            f"请使用至少 {MIN_MASTER_PASSWORD_LEN} 位、尽量复杂的主密码。"
             if first
-            else "数据已用国密 SM3/SM4 加密存储。\n请输入主密码解锁保险库。"
+            else "数据已用国密 SM3/SM4-MAC 加密存储。\n请输入主密码解锁保险库。"
         )
 
         ctk.CTkLabel(
@@ -384,15 +389,17 @@ class UnlockDialog(ctk.CTkToplevel):
         p1 = self.pw1.get()
         if self._first:
             p2 = self.pw2.get() if self.pw2 else ""
-            if len(p1) < 6:
-                self.err.configure(text="主密码至少 6 位", text_color=DANGER)
+            if len(p1) < MIN_MASTER_PASSWORD_LEN:
+                self.err.configure(
+                    text=f"主密码至少 {MIN_MASTER_PASSWORD_LEN} 位", text_color=DANGER
+                )
                 return
             if p1 != p2:
                 self.err.configure(text="两次输入的主密码不一致", text_color=DANGER)
                 return
         self._busy = True
         self._unlock_result: tuple[str, str] | None = None  # ("ok","") | ("err", msg)
-        self.err.configure(text="正在解锁（国密派生密钥，约 1～3 秒）…", text_color=TEXT_MUTED)
+        self.err.configure(text="正在解锁（国密派生密钥，请稍候）…", text_color=TEXT_MUTED)
 
         def work() -> None:
             # 注意：Tk 非线程安全，禁止在子线程里 self.after / 改 UI
@@ -416,7 +423,7 @@ class UnlockDialog(ctk.CTkToplevel):
             msg = self.err.cget("text") or ""
             if "正在解锁" in msg:
                 dots = msg.count(".") % 3
-                base = "正在解锁（国密派生密钥，约 1～3 秒）"
+                base = "正在解锁（国密派生密钥，请稍候）"
                 self.err.configure(text=base + "." * (dots + 1), text_color=TEXT_MUTED)
             self.after(80, self._poll_unlock)
             return
@@ -441,23 +448,28 @@ FIELD_CN = {
 
 
 def normalize_url(url: str) -> str:
+    """规范化网址；保留 ssh:// / rdp:// 等专用协议，不强制加 https。"""
     url = (url or "").strip()
     if not url:
         return ""
-    if not re.match(r"^https?://", url, re.I):
-        return "https://" + url
-    return url
+    # 已有明确协议（含 ssh/rdp/file 等）则原样返回
+    if re.match(r"^[a-z][a-z0-9+.\-]*:", url, re.I):
+        return url
+    # 裸主机/域名默认 https
+    return "https://" + url
 
 
 def normalize_totp_secret(raw: str) -> str:
-    """支持密钥或 otpauth 链接，返回清洗后的密钥。"""
+    """支持密钥或 otpauth 链接。
+
+    - otpauth://：保留完整 URI（含 algorithm/digits/period）
+    - 纯密钥：去空白、大写并补 Base32 padding
+    """
     raw = (raw or "").strip()
     if not raw:
         return ""
     if raw.lower().startswith("otpauth://"):
-        m = re.search(r"[?&]secret=([^&]+)", raw, re.I)
-        if m:
-            raw = m.group(1)
+        return raw
     secret = re.sub(r"[\s\-]+", "", raw).upper()
     pad = (-len(secret)) % 8
     if pad:
@@ -465,15 +477,32 @@ def normalize_totp_secret(raw: str) -> str:
     return secret
 
 
+def _totp_from_raw(raw: str) -> tuple[Any, int]:
+    """返回 (pyotp.TOTP 或 OTP 对象, period 秒)。"""
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("empty")
+    if raw.lower().startswith("otpauth://"):
+        totp = pyotp.parse_uri(raw)
+        period = int(getattr(totp, "interval", None) or 30)
+        return totp, period
+    secret = normalize_totp_secret(raw)
+    totp = pyotp.TOTP(secret)
+    return totp, 30
+
+
 def totp_code(secret: str) -> tuple[str, int]:
-    secret = normalize_totp_secret(secret)
-    if not secret:
+    """生成当前验证码与剩余秒数；尊重 otpauth 中的算法/位数/周期。"""
+    if not (secret or "").strip():
         return ("", 0)
     try:
-        totp = pyotp.TOTP(secret)
+        totp, period = _totp_from_raw(secret)
         code = totp.now()
-        remaining = 30 - (int(time.time()) % 30)
-        return (code, remaining)
+        period = max(int(period), 1)
+        remaining = period - (int(time.time()) % period)
+        if remaining <= 0:
+            remaining = period
+        return (str(code), remaining)
     except Exception:
         return ("无效密钥", 0)
 
@@ -498,18 +527,152 @@ class AccountVaultApp(ctk.CTk):
         self._last_totp_ui: tuple[str, str] = ("", "")
         self._filling_form = False
         self._cats_cache: list[str] | None = None
+        self._import_running = False
+        self._clipboard_clear_after_id: str | None = None
+        self._clipboard_expect: str | None = None
+        self._idle_after_id: str | None = None
+        self._locked_overlay: ctk.CTkToplevel | None = None
 
         self._build_ui()
         self._build_site_context_menu()
         # 延后首屏刷新，先显示窗口骨架，减少“卡住”感
         self.after(10, self._bootstrap_ui)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 空闲自动锁定：任意键鼠活动重置计时
+        self.bind_all("<Any-KeyPress>", self._note_activity, add="+")
+        self.bind_all("<Any-Button>", self._note_activity, add="+")
+        self.bind_all("<Motion>", self._note_activity, add="+")
+        self._reset_idle_timer()
 
     def _bootstrap_ui(self) -> None:
         self.refresh_sites()
         self.refresh_accounts()
         self._tick_totp()
         self._update_crypto_label()
+
+    def _note_activity(self, _event: Any = None) -> None:
+        if self.storage.is_unlocked():
+            self._reset_idle_timer()
+
+    def _reset_idle_timer(self) -> None:
+        if self._idle_after_id is not None:
+            try:
+                self.after_cancel(self._idle_after_id)
+            except Exception:
+                pass
+            self._idle_after_id = None
+        if self.storage.is_unlocked():
+            self._idle_after_id = self.after(IDLE_LOCK_MS, self._idle_lock)
+
+    def _idle_lock(self) -> None:
+        """空闲超时：锁定保险库并弹出重新解锁。"""
+        self._idle_after_id = None
+        if not self.storage.is_unlocked():
+            return
+        if self._import_running or self.storage.is_busy():
+            # 忙碌中推迟
+            self._reset_idle_timer()
+            return
+        try:
+            self.storage.lock()
+        except Exception:
+            pass
+        self._show_reunlock_dialog()
+
+    def _show_reunlock_dialog(self) -> None:
+        if self._locked_overlay is not None:
+            return
+        dlg = ctk.CTkToplevel(self)
+        self._locked_overlay = dlg
+        dlg.title("已自动锁定")
+        dlg.geometry("400x260")
+        dlg.configure(fg_color=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # 必须解锁
+        apply_window_icon(dlg)
+
+        ctk.CTkLabel(
+            dlg,
+            text="保险库已锁定",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=TEXT,
+        ).pack(anchor="w", padx=24, pady=(22, 6))
+        ctk.CTkLabel(
+            dlg,
+            text="因空闲超时，敏感数据已从内存清除。\n请重新输入主密码继续。",
+            text_color=TEXT_MUTED,
+            justify="left",
+        ).pack(anchor="w", padx=24, pady=(0, 12))
+        ctk.CTkLabel(dlg, text="主密码", text_color=TEXT_MUTED).pack(anchor="w", padx=24)
+        pw = ctk.CTkEntry(dlg, show="•", height=34, fg_color=BG_SOFT, border_color=BORDER)
+        pw.pack(fill="x", padx=24, pady=(4, 8))
+        err = ctk.CTkLabel(dlg, text="", text_color=DANGER)
+        err.pack(anchor="w", padx=24)
+
+        def do_unlock() -> None:
+            try:
+                self.storage.unlock(pw.get())
+            except Exception as e:
+                err.configure(text=str(e))
+                return
+            self._locked_overlay = None
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+            self._update_crypto_label()
+            self.refresh_accounts()
+            if self.selected_id:
+                acc = self.storage.get_account(self.selected_id)
+                self._fill_form(acc)
+            self._reset_idle_timer()
+            self.status_label.configure(text="已重新解锁")
+
+        pw.bind("<Return>", lambda _e: do_unlock())
+        ctk.CTkButton(
+            dlg, text="解锁", fg_color=PRIMARY, hover_color=PRIMARY_HOVER, command=do_unlock
+        ).pack(pady=14)
+        self.after(100, pw.focus_set)
+
+    def _copy_sensitive(self, value: str, label: str) -> None:
+        """复制敏感内容，并在超时后尝试清空剪贴板。"""
+        self.clipboard_clear()
+        self.clipboard_append(value)
+        self._clipboard_expect = value
+        if self._clipboard_clear_after_id is not None:
+            try:
+                self.after_cancel(self._clipboard_clear_after_id)
+            except Exception:
+                pass
+        self._clipboard_clear_after_id = self.after(
+            CLIPBOARD_CLEAR_MS, self._clear_clipboard_if_unchanged
+        )
+        self.status_label.configure(
+            text=f"已复制{label}（{CLIPBOARD_CLEAR_MS // 1000} 秒后尝试清空剪贴板）"
+        )
+        self._note_activity()
+
+    def _clear_clipboard_if_unchanged(self) -> None:
+        self._clipboard_clear_after_id = None
+        expect = self._clipboard_expect
+        self._clipboard_expect = None
+        if expect is None:
+            return
+        try:
+            current = self.clipboard_get()
+        except Exception:
+            return
+        if current == expect:
+            try:
+                self.clipboard_clear()
+                self.clipboard_append("")
+            except Exception:
+                pass
+            try:
+                self.status_label.configure(text="剪贴板已自动清空")
+            except Exception:
+                pass
 
     # ---------------- 界面 ----------------
     def _build_ui(self) -> None:
@@ -1221,19 +1384,21 @@ class AccountVaultApp(ctk.CTk):
         if not value:
             self.status_label.configure(text="内容为空，无法复制")
             return
-        self.clipboard_clear()
-        self.clipboard_append(value)
         cn = FIELD_CN.get(key, key)
-        self.status_label.configure(text=f"已复制{cn}")
+        if key in ("password", "totp_secret"):
+            self._copy_sensitive(value, cn)
+        else:
+            self.clipboard_clear()
+            self.clipboard_append(value)
+            self.status_label.configure(text=f"已复制{cn}")
+            self._note_activity()
 
     def _copy_totp_code(self) -> None:
         code, _ = totp_code(self._entry_get("totp_secret"))
         if not code or code == "无效密钥":
             self.status_label.configure(text="无有效验证码")
             return
-        self.clipboard_clear()
-        self.clipboard_append(code)
-        self.status_label.configure(text="已复制验证码")
+        self._copy_sensitive(code, "验证码")
 
     def _open_website(self) -> None:
         self._open_url(self._entry_get("website"))
@@ -1257,7 +1422,11 @@ class AccountVaultApp(ctk.CTk):
             state = ("密钥无效", "请检查密钥格式")
             color = DANGER
         else:
-            pretty = f"{code[:3]} {code[3:]}" if len(code) == 6 else code
+            if code.isdigit() and len(code) in (6, 7, 8):
+                mid = len(code) // 2
+                pretty = f"{code[:mid]} {code[mid:]}"
+            else:
+                pretty = code
             state = (pretty, f"剩余 {remain} 秒 · 自动刷新")
             color = PRIMARY
         if state == self._last_totp_ui:
@@ -1312,13 +1481,29 @@ class AccountVaultApp(ctk.CTk):
             self.crypto_label.configure(text=self.storage.crypto_info())
 
     def _import_dialog(self) -> None:
+        if self._import_running or self.storage.is_busy():
+            messagebox.showwarning(
+                "请稍候",
+                f"正在执行「{self.storage.busy_op() or '其他操作'}」，请完成后再导入。",
+            )
+            return
+
         dlg = ctk.CTkToplevel(self)
         dlg.title("批量导入账户")
-        dlg.geometry("720x560")
+        dlg.geometry("820x640")
         dlg.configure(fg_color=BG)
         dlg.transient(self)
         dlg.grab_set()
         apply_window_icon(dlg)
+        import_active = {"running": False}
+
+        def try_close() -> None:
+            if import_active["running"]:
+                messagebox.showwarning("导入进行中", "请等待导入完成后再关闭。", parent=dlg)
+                return
+            dlg.destroy()
+
+        dlg.protocol("WM_DELETE_WINDOW", try_close)
 
         ctk.CTkLabel(
             dlg,
@@ -1330,13 +1515,12 @@ class AccountVaultApp(ctk.CTk):
             dlg,
             text="粘贴文本或选择文件；支持 JSON / CSV / GPT账号 / SSH / RDP / 文本块，可自动识别",
             text_color=TEXT_MUTED,
-            wraplength=660,
+            wraplength=760,
             justify="left",
         ).pack(anchor="w", padx=20, pady=(0, 8))
 
         bar = ctk.CTkFrame(dlg, fg_color="transparent")
         bar.pack(fill="x", padx=20, pady=(0, 6))
-        fmt_var = ctk.StringVar(value="auto")
         ctk.CTkLabel(bar, text="格式", text_color=TEXT_MUTED).pack(side="left")
         fmt_box = make_combo(
             bar,
@@ -1354,12 +1538,55 @@ class AccountVaultApp(ctk.CTk):
             border_width=1,
             border_color=BORDER,
             text_color=TEXT,
-            height=280,
+            height=180,
         )
-        text.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        text.pack(fill="x", padx=20, pady=(0, 8))
         text.insert("1.0", FORMAT_HELP)
 
+        # 字段预览表（避免静默截断密码而不自知）
+        preview_frame = ctk.CTkFrame(dlg, fg_color=BG_SOFT, border_width=1, border_color=BORDER)
+        preview_frame.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        preview_header = ctk.CTkLabel(
+            preview_frame,
+            text="解析预览（导入前请核对账号 / 密码 / 网站）",
+            text_color=TEXT_MUTED,
+            anchor="w",
+        )
+        preview_header.pack(fill="x", padx=10, pady=(8, 4))
+        preview_box = ctk.CTkTextbox(
+            preview_frame,
+            fg_color=BG,
+            border_width=0,
+            text_color=TEXT,
+            height=160,
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        preview_box.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        preview_box.insert("1.0", "（点击「预览解析」后在此显示字段）")
+        preview_box.configure(state="disabled")
+
+        def render_preview_table(items: list[dict[str, Any]]) -> None:
+            lines = [
+                f"{'标题':<14} {'账号':<22} {'密码':<18} {'TOTP':<10} {'网站/主机'}",
+                "-" * 96,
+            ]
+            for it in items[:80]:
+                title = (it.get("title") or "")[:12]
+                user = (it.get("username") or "")[:20]
+                pwd = (it.get("password") or "")[:16]
+                totp = "有" if (it.get("totp_secret") or "").strip() else ""
+                site = (it.get("website") or "")[:28]
+                lines.append(f"{title:<14} {user:<22} {pwd:<18} {totp:<10} {site}")
+            if len(items) > 80:
+                lines.append(f"… 另有 {len(items) - 80} 条未显示")
+            preview_box.configure(state="normal")
+            preview_box.delete("1.0", "end")
+            preview_box.insert("1.0", "\n".join(lines))
+            preview_box.configure(state="disabled")
+
         def load_file() -> None:
+            if import_active["running"]:
+                return
             path = filedialog.askopenfilename(
                 parent=dlg,
                 title="选择导入文件",
@@ -1371,6 +1598,7 @@ class AccountVaultApp(ctk.CTk):
             if not path:
                 return
             raw = Path(path).read_bytes()
+            content = None
             for enc in ("utf-8-sig", "utf-8", "gbk", "gb18030", "latin-1"):
                 try:
                     content = raw.decode(enc)
@@ -1386,31 +1614,57 @@ class AccountVaultApp(ctk.CTk):
 
         def do_preview() -> tuple[str, list[dict[str, Any]]]:
             body = text.get("1.0", "end").strip()
-            # 若还是帮助文案，不导入
             if body.startswith("支持格式"):
                 return ("", [])
             name, items = detect_and_parse(body, force_format=fmt_box.get() or "auto")
             return name, items
 
         def preview() -> None:
+            if import_active["running"]:
+                return
             name, items = do_preview()
             if not items:
                 status.configure(text="未解析到账户，请检查格式")
+                render_preview_table([])
+                preview_box.configure(state="normal")
+                preview_box.delete("1.0", "end")
+                preview_box.insert("1.0", "未解析到账户")
+                preview_box.configure(state="disabled")
                 return
             status.configure(text=f"识别为「{name}」，共 {len(items)} 条（预览未写入）")
+            render_preview_table(items)
+
+        btn_import: ctk.CTkButton
+        btn_close: ctk.CTkButton
+
+        def set_import_ui_busy(busy: bool) -> None:
+            import_active["running"] = busy
+            self._import_running = busy
+            state = "disabled" if busy else "normal"
+            try:
+                btn_import.configure(state=state)
+                btn_close.configure(state=state)
+                fmt_box.configure(state=state)
+            except Exception:
+                pass
 
         def do_import() -> None:
+            if import_active["running"]:
+                return
             name, items = do_preview()
             if not items:
                 messagebox.showwarning("提示", "未解析到可导入账户", parent=dlg)
                 return
+            render_preview_table(items)
             if not pretty_confirm(
                 dlg,
                 "确认导入",
-                f"识别格式：{name}\n将导入 {len(items)} 条账户，是否继续？",
+                f"识别格式：{name}\n将导入 {len(items)} 条账户，是否继续？\n\n"
+                "请确认上方预览中的密码字段无误。",
             ):
                 return
             status.configure(text="正在加密写入…")
+            set_import_ui_busy(True)
             dlg.update_idletasks()
             import_state: dict[str, Any] = {"done": False}
 
@@ -1429,6 +1683,7 @@ class AccountVaultApp(ctk.CTk):
                 if not import_state.get("done"):
                     dlg.after(50, poll)
                     return
+                set_import_ui_busy(False)
                 if import_state.get("ok"):
                     n = int(import_state.get("n") or 0)
                     fmt_name = str(import_state.get("name") or "")
@@ -1455,28 +1710,41 @@ class AccountVaultApp(ctk.CTk):
             btns, text="预览解析", width=100, fg_color="#EEF2FF", hover_color="#DBEAFE",
             text_color=PRIMARY, command=preview,
         ).pack(side="left", padx=8)
-        ctk.CTkButton(
+        btn_import = ctk.CTkButton(
             btns, text="开始导入", width=120, fg_color=SUCCESS, hover_color="#047857",
             command=do_import,
-        ).pack(side="right")
-        ctk.CTkButton(
+        )
+        btn_import.pack(side="right")
+        btn_close = ctk.CTkButton(
             btns, text="关闭", width=80, fg_color="#E5E7EB", hover_color="#D1D5DB",
-            text_color=TEXT, command=dlg.destroy,
-        ).pack(side="right", padx=(0, 8))
+            text_color=TEXT, command=try_close,
+        )
+        btn_close.pack(side="right", padx=(0, 8))
 
     def _change_master_password_dialog(self) -> None:
+        if self._import_running or self.storage.is_busy():
+            messagebox.showwarning(
+                "请稍候",
+                f"正在执行「{self.storage.busy_op() or '导入/其他操作'}」，请完成后再修改主密码。",
+            )
+            return
+
         dlg = ctk.CTkToplevel(self)
         dlg.title("修改主密码")
-        dlg.geometry("400x340")
+        dlg.geometry("420x380")
         dlg.configure(fg_color=BG)
         dlg.transient(self)
         dlg.grab_set()
 
         ctk.CTkLabel(
             dlg,
-            text="修改后将用新主密码重新加密全部敏感数据",
+            text=(
+                f"修改后将用新主密码重新加密全部敏感数据（单事务）。\n"
+                f"操作前自动备份数据库；新密码至少 {MIN_MASTER_PASSWORD_LEN} 位。"
+            ),
             text_color=TEXT_MUTED,
-            wraplength=340,
+            wraplength=360,
+            justify="left",
         ).pack(anchor="w", padx=20, pady=(18, 10))
 
         def labeled_entry(label: str) -> ctk.CTkEntry:
@@ -1486,23 +1754,36 @@ class AccountVaultApp(ctk.CTk):
             return e
 
         old_e = labeled_entry("原主密码")
-        new_e = labeled_entry("新主密码（至少 6 位）")
+        new_e = labeled_entry(f"新主密码（至少 {MIN_MASTER_PASSWORD_LEN} 位）")
         new2_e = labeled_entry("确认新主密码")
-        err = ctk.CTkLabel(dlg, text="", text_color=DANGER)
+        err = ctk.CTkLabel(dlg, text="", text_color=DANGER, wraplength=360, justify="left")
         err.pack(anchor="w", padx=20)
 
         def ok() -> None:
+            if self._import_running or self.storage.is_busy():
+                err.configure(text="有其他操作进行中，请稍后再试")
+                return
             if new_e.get() != new2_e.get():
                 err.configure(text="两次新主密码不一致")
                 return
+            if len(new_e.get()) < MIN_MASTER_PASSWORD_LEN:
+                err.configure(text=f"新主密码至少 {MIN_MASTER_PASSWORD_LEN} 位")
+                return
             try:
-                self.storage.change_master_password(old_e.get(), new_e.get())
+                bak = self.storage.change_master_password(old_e.get(), new_e.get())
+            except VaultBusyError as e:
+                err.configure(text=str(e))
+                return
             except Exception as e:
                 err.configure(text=str(e))
                 return
             self._update_crypto_label()
             self.status_label.configure(text="主密码已修改，数据已重新加密")
-            messagebox.showinfo("成功", "主密码已修改", parent=dlg)
+            messagebox.showinfo(
+                "成功",
+                f"主密码已修改。\n备份文件：\n{bak}",
+                parent=dlg,
+            )
             dlg.destroy()
 
         ctk.CTkButton(dlg, text="确认修改", fg_color=PRIMARY, hover_color=PRIMARY_HOVER, command=ok).pack(
@@ -1510,6 +1791,17 @@ class AccountVaultApp(ctk.CTk):
         )
 
     def _on_close(self) -> None:
+        if self._import_running or self.storage.is_busy():
+            if not messagebox.askyesno(
+                "操作进行中",
+                "仍有导入或写入操作未完成，强制退出可能损坏数据。确定退出吗？",
+            ):
+                return
+        try:
+            if self._idle_after_id is not None:
+                self.after_cancel(self._idle_after_id)
+        except Exception:
+            pass
         try:
             if hasattr(self, "site_popup"):
                 self.site_popup.close()
@@ -1517,6 +1809,16 @@ class AccountVaultApp(ctk.CTk):
             pass
         try:
             self.storage.close()
+        except VaultBusyError:
+            try:
+                # 最后尝试阻塞关闭
+                self.storage._begin_op("关闭", block=True)
+                self.storage._sm4_key = None
+                self.storage._account_cache.clear()
+                self.storage._conn.close()
+                self.storage._end_op()
+            except Exception:
+                pass
         except Exception:
             pass
         self.destroy()
@@ -1541,19 +1843,22 @@ def main() -> None:
 
     root.destroy()
     app = AccountVaultApp(storage)
-    if not app.storage.list_accounts():
-        app.storage.add_account(
-            {
-                "title": "对话示例账户",
-                "category": "人工智能",
-                "username": "you@example.com",
-                "password": "请修改密码",
-                "totp_secret": "",
-                "website": "https://chatgpt.com",
-                "notes": "这是示例数据，可编辑或删除。密码与二次验证密钥均国密加密。",
-            }
-        )
-        app.refresh_accounts()
+    # 仅首次启动写入示例账户；用户删光后不再复活
+    if storage.should_seed_sample_account():
+        storage.mark_sample_account_seeded()
+        if storage.count_accounts() == 0:
+            storage.add_account(
+                {
+                    "title": "对话示例账户",
+                    "category": "人工智能",
+                    "username": "you@example.com",
+                    "password": "请修改密码",
+                    "totp_secret": "",
+                    "website": "https://chatgpt.com",
+                    "notes": "这是示例数据，可编辑或删除。密码与二次验证密钥均国密加密。",
+                }
+            )
+            app.refresh_accounts()
     app.mainloop()
 
 

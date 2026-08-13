@@ -22,12 +22,32 @@ def _blank() -> dict[str, str]:
 
 
 def _clean_totp(s: str) -> str:
+    """清洗 TOTP：otpauth URI 保留完整参数；纯密钥则去空白并大写。"""
     s = (s or "").strip()
+    if not s:
+        return ""
     if s.lower().startswith("otpauth://"):
-        m = re.search(r"[?&]secret=([^&]+)", s, re.I)
-        if m:
-            s = unquote(m.group(1))
+        # 保留完整 URI，供 pyotp.parse_uri 使用
+        return s
     return re.sub(r"[\s\-]+", "", s).upper()
+
+
+def looks_like_totp_secret(s: str) -> bool:
+    """判断字符串是否像 TOTP 密钥或 otpauth URI（避免把密码片段误当 2FA）。"""
+    s = (s or "").strip()
+    if not s:
+        return False
+    if s.lower().startswith("otpauth://"):
+        return "secret=" in s.lower()
+    cleaned = re.sub(r"[\s\-]+", "", s).upper()
+    # Base32 字母表 + 可选 padding；常见密钥长度 ≥ 16
+    if len(cleaned) < 16:
+        return False
+    if not re.fullmatch(r"[A-Z2-7]+=*", cleaned):
+        return False
+    # 去掉 padding 后长度至少 16
+    core = cleaned.rstrip("=")
+    return len(core) >= 16
 
 
 def _norm_account(raw: dict[str, Any]) -> dict[str, str] | None:
@@ -199,40 +219,76 @@ _SEP_LINE = re.compile(
 )
 
 
+def _split_user_pass_totp(line: str) -> list[str] | None:
+    """将一行解析为 [user, password] 或 [user, password, totp]。
+
+    对冒号分隔：仅当最后一段像 TOTP 密钥时才拆出 2FA，否则把第一段之后全部当作密码
+    （避免 alice@x.com:p@ss:word 被截成密码 p@ss）。
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    # 优先按多字符分隔符切分（避免密码吞掉 2FA）
+    for sep in ("----", "---", "|", "\t"):
+        if sep in line:
+            parts = [p.strip() for p in line.split(sep) if p.strip()]
+            if len(parts) >= 2:
+                if len(parts) >= 3 and not looks_like_totp_secret(parts[-1]):
+                    # 末段不像 TOTP：合并为密码
+                    return [parts[0], sep.join(parts[1:])]
+                return parts[:3] if len(parts) >= 3 else parts[:2]
+            break
+
+    # email:password[:totp?] 或 email,password
+    for sep in (":", ","):
+        if sep not in line:
+            continue
+        # 用户名取第一段；需含 @ 或看起来像账号
+        first, rest = line.split(sep, 1)
+        first, rest = first.strip(), rest.strip()
+        if not rest or not ("@" in first or first.replace("_", "").isalnum()):
+            continue
+        if sep == ":":
+            # rest 可能是 password 或 password:totp 或 p@ss:word（密码含冒号）
+            if ":" in rest:
+                # 从右侧尝试：最后一段若像 TOTP 则拆出
+                left, maybe_totp = rest.rsplit(":", 1)
+                left, maybe_totp = left.strip(), maybe_totp.strip()
+                if left and looks_like_totp_secret(maybe_totp):
+                    return [first, left, maybe_totp]
+                # 否则整段 rest 都是密码
+                return [first, rest]
+            return [first, rest]
+        # 逗号：最多拆三段
+        parts = [first] + [p.strip() for p in rest.split(",", 1)]
+        parts = [p for p in parts if p]
+        if len(parts) >= 3 and not looks_like_totp_secret(parts[2]):
+            return [parts[0], ",".join(parts[1:])]
+        return parts[:3] if len(parts) >= 3 else parts[:2]
+
+    m = _SEP_LINE.match(line)
+    if m:
+        parsed = [m.group("user"), m.group("pwd")]
+        if m.group("totp") and looks_like_totp_secret(m.group("totp")):
+            parsed.append(m.group("totp"))
+        return parsed
+    return None
+
+
 def parse_delimited_accounts(text: str, default_category: str = "人工智能") -> list[dict[str, str]]:
     out = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("//"):
             continue
-        parsed = None
-        # 优先按多字符分隔符切分（避免密码吞掉 2FA）
-        for sep in ("----", "---", "|", "\t"):
-            if sep in line:
-                parts = [p.strip() for p in line.split(sep) if p.strip()]
-                if len(parts) >= 2:
-                    parsed = parts
-                break
-        if parsed is None and (":" in line or "," in line):
-            # email:password 或 email,password（仅两段时）
-            for sep in (":", ","):
-                if sep in line:
-                    parts = [p.strip() for p in line.split(sep, 2)]
-                    if len(parts) >= 2 and ("@" in parts[0] or parts[0].isalnum()):
-                        parsed = parts
-                        break
-        if parsed is None:
-            m = _SEP_LINE.match(line)
-            if m:
-                parsed = [m.group("user"), m.group("pwd")]
-                if m.group("totp"):
-                    parsed.append(m.group("totp"))
+        parsed = _split_user_pass_totp(line)
         if not parsed or len(parsed) < 2:
             continue
         a = _blank()
         a["username"] = parsed[0]
         a["password"] = parsed[1]
-        if len(parsed) >= 3:
+        if len(parsed) >= 3 and looks_like_totp_secret(parsed[2]):
             a["totp_secret"] = _clean_totp(parsed[2])
         a["category"] = default_category
         a["title"] = a["username"].split("@")[0] if "@" in a["username"] else a["username"]
@@ -242,6 +298,13 @@ def parse_delimited_accounts(text: str, default_category: str = "人工智能") 
         if n:
             out.append(n)
     return out
+
+
+# user@host:port password （SSH/RDP 文档格式）
+_HOST_PORT_PASS = re.compile(
+    r"^(?P<user>[^\s@]+)@(?P<host>[^\s:]+):(?P<port>\d+)\s+(?P<pwd>\S+)\s*$",
+    re.I,
+)
 
 
 # ---------- SSH ----------
@@ -422,6 +485,39 @@ def parse_blocks(text: str) -> list[dict[str, str]]:
     return out
 
 
+def _looks_like_ssh_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if s.lower().startswith("ssh://") or s.lower().startswith("ssh "):
+        return True
+    m = _HOST_PORT_PASS.match(s)
+    if m and m.group("port") not in ("3389", "3390"):
+        # 22 等常见 SSH 端口，或非 3389
+        return True
+    if "|" in s and s.count("|") >= 2:
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) >= 4 and parts[1].isdigit() and parts[1] not in ("3389", "3390"):
+            return True
+    return False
+
+
+def _looks_like_rdp_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if s.lower().startswith("rdp://") or s.lower().startswith("rdp "):
+        return True
+    m = _HOST_PORT_PASS.match(s)
+    if m and m.group("port") in ("3389", "3390"):
+        return True
+    if "|" in s and s.count("|") >= 2:
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) >= 4 and parts[1] in ("3389", "3390"):
+            return True
+    return False
+
+
 def detect_and_parse(text: str, force_format: str = "auto") -> tuple[str, list[dict[str, str]]]:
     """
     返回 (识别到的格式名, 账户列表)。
@@ -433,23 +529,48 @@ def detect_and_parse(text: str, force_format: str = "auto") -> tuple[str, list[d
 
     fmt = force_format.lower().strip()
     if fmt == "auto":
-        # 启发式
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        # 启发式（SSH/RDP 优先于 GPT，避免 user@host:22 pass 被当成邮箱账号）
         if text[0] in "{[":
             fmt = "json"
         elif re.search(r"(?i)^(title|name|username|url|password|账号|标题|名称)\s*[,;\t]", text):
             fmt = "csv"
-        elif re.search(r"(?i)^\s*ssh(\s|:|/)", text, re.M) or re.search(
-            r"(?m)^\s*[^|\s]+@[^|\s]+(?::\d+)?(?:\s+\S+)?\s*$", text
-        ) and "ssh" in text.lower():
+        elif (
+            re.search(r"(?i)^\s*ssh(\s|:|/)", text, re.M)
+            or "ssh://" in text.lower()
+            or (lines and all(_looks_like_ssh_line(ln) or _looks_like_rdp_line(ln) for ln in lines)
+                and any(_looks_like_ssh_line(ln) for ln in lines)
+                and not any(_looks_like_rdp_line(ln) for ln in lines))
+            or (lines and all(_looks_like_ssh_line(ln) for ln in lines))
+        ):
             fmt = "ssh"
-        elif re.search(r"(?i)^\s*rdp(\s|:|/)", text, re.M) or "rdp://" in text.lower():
+        elif (
+            re.search(r"(?i)^\s*rdp(\s|:|/)", text, re.M)
+            or "rdp://" in text.lower()
+            or (lines and all(_looks_like_rdp_line(ln) for ln in lines))
+        ):
             fmt = "rdp"
-        elif "----" in text or re.search(r"\S+@\S+\s*(\||----|:)\s*\S+", text):
+        elif lines and all(_looks_like_ssh_line(ln) or _looks_like_rdp_line(ln) for ln in lines):
+            # 混合：按多数
+            ssh_n = sum(1 for ln in lines if _looks_like_ssh_line(ln))
+            rdp_n = sum(1 for ln in lines if _looks_like_rdp_line(ln))
+            fmt = "rdp" if rdp_n > ssh_n else "ssh"
+        elif "----" in text or re.search(r"\S+@\S+\s*(\||----)\s*\S+", text):
             fmt = "gpt"
         elif re.search(r"(账号|用户名|密码)\s*[:：]", text):
             fmt = "block"
         elif "," in text.splitlines()[0] and text.count("\n") >= 1:
             fmt = "csv"
+        elif re.search(r"\S+@\S+:\S+", text):
+            # email:password — 仅当不像 host:port 时
+            if lines and all(_HOST_PORT_PASS.match(ln) for ln in lines):
+                # 再保险：端口 3389 → rdp，否则 ssh
+                if all((_HOST_PORT_PASS.match(ln).group("port") in ("3389", "3390")) for ln in lines):  # type: ignore
+                    fmt = "rdp"
+                else:
+                    fmt = "ssh"
+            else:
+                fmt = "gpt"
         else:
             fmt = "gpt"
 
