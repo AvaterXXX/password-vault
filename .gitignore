@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
 
 # PyInstaller
 build/
@@ -21,9 +23,24 @@ Thumbs.db
 
 # Local runtime data (never commit secrets)
 *.db
+*.db-*
+*.sqlite
+*.sqlite3
 *.key
+*.pem
+*.p12
+*.pfx
+*.kdbx
+*.bak
+*.backup
 vault.db
 vault.key
+backups/
+exports/
+credentials*.json
+secrets*.json
+vault*.json
+accounts*.json
 
 # Local previews / temp
 preview*.png

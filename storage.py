@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import threading
@@ -37,6 +38,210 @@ def app_data_dir() -> Path:
     return path
 
 
+# 数据库位置来自仓库历史代码：Windows 使用 APPDATA，未设置 APPDATA 时使用
+# home 下的回退目录。没有仓库证据的项目目录/EXE 同目录路径不在候选列表中，
+# 避免误把无关的 vault.db 当成用户保险库。
+_ACCOUNT_SCHEMA = (
+    ("id", "TEXT PRIMARY KEY"),
+    ("title", "TEXT NOT NULL DEFAULT '未命名'"),
+    ("category", "TEXT NOT NULL DEFAULT '其他'"),
+    ("username", "TEXT NOT NULL DEFAULT ''"),
+    ("password_enc", "TEXT NOT NULL DEFAULT ''"),
+    ("totp_secret_enc", "TEXT NOT NULL DEFAULT ''"),
+    ("website", "TEXT NOT NULL DEFAULT ''"),
+    ("notes", "TEXT NOT NULL DEFAULT ''"),
+    ("created_at", "TEXT NOT NULL DEFAULT ''"),
+    ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+)
+_SITES_SCHEMA = (
+    ("id", "TEXT PRIMARY KEY"),
+    ("name", "TEXT NOT NULL DEFAULT ''"),
+    ("url", "TEXT NOT NULL DEFAULT ''"),
+    ("sort_order", "INTEGER NOT NULL DEFAULT 0"),
+)
+_META_SCHEMA = (("key", "TEXT PRIMARY KEY"), ("value", "TEXT NOT NULL DEFAULT ''"))
+_TABLE_SCHEMAS = {
+    "accounts": _ACCOUNT_SCHEMA,
+    "sites": _SITES_SCHEMA,
+    "vault_meta": _META_SCHEMA,
+}
+
+
+def _read_only_connection(path: Path) -> sqlite3.Connection:
+    """以只读方式打开已有数据库，绝不因为探测而创建文件。"""
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    return sqlite3.connect(uri, uri=True)
+
+
+def _new_backup_path(path: Path, reason: str) -> Path:
+    safe_reason = re.sub(r"[^\w\-]+", "_", reason)[:32] or "bak"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    for _ in range(20):
+        suffix = secrets.token_hex(3)
+        candidate = path.with_name(
+            f"{path.stem}.{safe_reason}.{stamp}-{suffix}.bak"
+        )
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"无法为数据库创建唯一备份文件：{path}")
+
+
+def _backup_existing_file(path: Path, reason: str) -> Path:
+    """在任何 schema/加密升级前生成可恢复副本。
+
+    正常 SQLite 文件使用 backup API；损坏或尚未有 schema 的文件则退回到
+    原始字节复制。目标文件名唯一，绝不覆盖已有备份。
+    """
+    backup_path = _new_backup_path(path, reason)
+    source: sqlite3.Connection | None = None
+    target: sqlite3.Connection | None = None
+    try:
+        try:
+            source = _read_only_connection(path)
+            target = sqlite3.connect(str(backup_path))
+            source.backup(target)
+            target.commit()
+        except (OSError, sqlite3.DatabaseError):
+            if target is not None:
+                target.close()
+                target = None
+            try:
+                backup_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            shutil.copy2(path, backup_path)
+    except Exception:
+        try:
+            backup_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    finally:
+        if source is not None:
+            source.close()
+        if target is not None:
+            target.close()
+    return backup_path
+
+
+def _database_needs_schema_backup(path: Path) -> bool:
+    """判断初始化/补列是否会改写已有数据库。"""
+    try:
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+    except OSError:
+        return True
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _read_only_connection(path)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not set(_TABLE_SCHEMAS).issubset(tables):
+            return True
+        for table, columns in _TABLE_SCHEMAS.items():
+            actual = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if any(name not in actual for name, _definition in columns):
+                return True
+        return False
+    except (OSError, sqlite3.DatabaseError):
+        # 无法读取的旧文件也必须先做原始备份，再交给 SQLite 抛出明确错误。
+        return True
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _probe_database(path: Path) -> dict[str, Any]:
+    """只读探测候选库是否为本项目库以及是否已设置主密码。"""
+    result: dict[str, Any] = {
+        "path": path,
+        "exists": False,
+        "schema_valid": False,
+        "initialized": False,
+        "error": None,
+    }
+    try:
+        if not path.is_file():
+            return result
+        result["exists"] = True
+    except OSError as exc:
+        result["error"] = str(exc)
+        return result
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = _read_only_connection(path)
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not set(_TABLE_SCHEMAS).issubset(tables):
+            return result
+        for table, columns in _TABLE_SCHEMAS.items():
+            actual = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if any(name not in actual for name, _definition in columns):
+                return result
+        result["schema_valid"] = True
+        meta = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT key, value FROM vault_meta WHERE key IN "
+                "('password_verifier', 'kdf_salt')"
+            )
+        }
+        result["initialized"] = bool(
+            meta.get("password_verifier") and meta.get("kdf_salt")
+        )
+    except (OSError, sqlite3.DatabaseError) as exc:
+        result["error"] = str(exc)
+    finally:
+        if conn is not None:
+            conn.close()
+    return result
+
+
+def discover_database_path(data_dir: Path) -> tuple[Path, str | None, list[dict[str, Any]]]:
+    """发现旧库并返回 (选中路径, 提示, 候选探测结果)。
+
+    优先级固定且可解释：当前 APPDATA 目录 > 未设置 APPDATA 时的历史回退目录；
+    在同一优先级下优先已初始化且 schema 完整的库。只读探测，不复制、移动或
+    覆盖任何候选文件。
+    """
+    current = data_dir / "vault.db"
+    fallback = Path.home() / ".account_vault" / "AccountVault" / "vault.db"
+    candidates: list[Path] = [current]
+    if fallback != current:
+        candidates.append(fallback)
+    probes = [_probe_database(path) for path in candidates]
+    existing = [probe for probe in probes if probe["exists"]]
+    initialized = [
+        probe for probe in existing if probe["schema_valid"] and probe["initialized"]
+    ]
+    schema_valid = [probe for probe in existing if probe["schema_valid"]]
+    selected_probe = (initialized or schema_valid or existing or [probes[0]])[0]
+    selected = selected_probe["path"]
+    note: str | None = None
+    if len(existing) > 1 or selected != current:
+        names = ", ".join(str(probe["path"]) for probe in existing)
+        if selected != current and selected_probe["initialized"]:
+            note = (
+                f"已发现旧保险库并继续使用：{selected}。"
+                "未复制或覆盖原数据库；如需迁移请先保留备份。"
+            )
+        else:
+            note = f"检测到多个数据库候选，按固定优先级使用：{selected}。候选：{names}"
+    return selected, note, probes
+
+
 class VaultLockedError(RuntimeError):
     pass
 
@@ -47,18 +252,55 @@ class VaultBusyError(RuntimeError):
 
 class VaultStorage:
     MIN_PASSWORD_LEN = 8
+    PIN_MIN_LEN = 4
+    PIN_MAX_LEN = 12
 
     def __init__(self, db_path: Path | None = None) -> None:
         self.data_dir = app_data_dir()
-        self.db_path = db_path or (self.data_dir / "vault.db")
-        self.key_path = self.data_dir / "vault.key"  # 旧版 Fernet 密钥，迁移后删除
+        if db_path is None:
+            (
+                self.db_path,
+                self.database_discovery_note,
+                self.database_candidates,
+            ) = discover_database_path(self.data_dir)
+        else:
+            self.db_path = Path(db_path)
+            self.database_discovery_note = None
+            self.database_candidates = [_probe_database(self.db_path)]
+        # 旧版 Fernet 密钥历史上与 vault.db 位于同一数据目录。只有选中的
+        # 路径就是当前数据目录时才使用该目录的 key，避免把另一候选库的
+        # vault.key 错配给旧库。
+        key_paths: list[Path] = [self.db_path.with_name("vault.key")]
+        data_key = self.data_dir / "vault.key"
+        if self.db_path == self.data_dir / "vault.db" and data_key not in key_paths:
+            key_paths.append(data_key)
+        self._legacy_key_paths = key_paths
+        self.key_path = key_paths[0]
         self._sm4_key: Optional[bytes] = None
         self._account_cache: dict[str, dict[str, Any]] = {}
+        # 锁定 PIN 只保存在当前进程内。程序重启仍必须输入主密码，避免把
+        # 弱 PIN 对应的主密钥包装值写入磁盘后可被离线穷举。
+        self._pin_salt: Optional[bytes] = None
+        self._pin_verifier: Optional[str] = None
+        self._pin_wrapped_key: Optional[str] = None
         self._lock = threading.RLock()
         self._current_op: Optional[str] = None
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._init_db()
+        self._schema_backup_path: Optional[Path] = None
+        self._crypto_backup_path: Optional[Path] = None
+        if _database_needs_schema_backup(self.db_path):
+            self._schema_backup_path = _backup_existing_file(
+                self.db_path, "before-schema"
+            )
+        try:
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._init_db()
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            raise
 
     # ---------- 锁 / 忙状态 ----------
     def is_busy(self) -> bool:
@@ -83,38 +325,78 @@ class VaultStorage:
 
     # ---------- 元数据 / 主密码 ----------
     def _init_db(self) -> None:
-        self._conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS accounts (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT '其他',
-                username TEXT NOT NULL DEFAULT '',
-                password_enc TEXT NOT NULL DEFAULT '',
-                totp_secret_enc TEXT NOT NULL DEFAULT '',
-                website TEXT NOT NULL DEFAULT '',
-                notes TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sites (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                url TEXT NOT NULL,
-                sort_order INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS vault_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            """
-        )
-        self._conn.commit()
-        # 仅首次（未打标）且站点表为空时写入默认网站；用户清空后不再复活
+        # 不使用 executescript：它会隐式提交，无法在 schema 失败时回滚。
+        try:
+            self._conn.execute("BEGIN")
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '其他',
+                    username TEXT NOT NULL DEFAULT '',
+                    password_enc TEXT NOT NULL DEFAULT '',
+                    totp_secret_enc TEXT NOT NULL DEFAULT '',
+                    website TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sites (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vault_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            self._ensure_schema_columns()
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+        # 仅首次（未打标）且站点表为空时写入默认网站；用户清空后不再复活。
         if not self._meta_get("defaults_sites_seeded"):
-            if self.count_sites() == 0:
-                self._seed_default_sites()
-            self._meta_set("defaults_sites_seeded", "1")
+            try:
+                self._conn.execute("BEGIN")
+                if self.count_sites() == 0:
+                    self._seed_default_sites(commit=False)
+                self._meta_set("defaults_sites_seeded", "1", commit=False)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _ensure_schema_columns(self) -> None:
+        """补齐可安全增加的旧列；主键缺失时拒绝猜测并保留备份。"""
+        for table, columns in _TABLE_SCHEMAS.items():
+            actual = {
+                row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            for name, definition in columns:
+                if name in actual:
+                    continue
+                if name in {"id", "key"}:
+                    raise RuntimeError(
+                        f"数据库表 {table} 缺少主键列 {name}，已保留原文件及升级前备份；"
+                        "请使用原版本打开或从备份恢复。"
+                    )
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                )
 
     def _meta_get(self, key: str) -> Optional[str]:
         row = self._conn.execute(
@@ -144,6 +426,38 @@ class VaultStorage:
         fp = fingerprint_key(self._sm4_key or b"")
         return f"国密 SM3/SM4-MAC · 密钥指纹 {fp}"
 
+    def _find_legacy_key_path(self) -> Optional[Path]:
+        for path in self._legacy_key_paths:
+            try:
+                if path.is_file():
+                    return path
+            except OSError:
+                continue
+        return None
+
+    def _has_crypto_migration_pending(self) -> bool:
+        """是否会在解锁后改写旧密文或移动旧版 vault.key。"""
+        if self._find_legacy_key_path() is not None:
+            return True
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM accounts WHERE "
+                "(password_enc != '' AND password_enc NOT LIKE 'GM1:%' AND password_enc NOT LIKE 'GM2:%') OR "
+                "(totp_secret_enc != '' AND totp_secret_enc NOT LIKE 'GM1:%' AND totp_secret_enc NOT LIKE 'GM2:%') OR "
+                "(notes != '' AND notes NOT LIKE 'GM1:%' AND notes NOT LIKE 'GM2:%') OR "
+                "password_enc LIKE 'GM1:%' OR totp_secret_enc LIKE 'GM1:%' OR notes LIKE 'GM1:%' "
+                "LIMIT 1"
+            ).fetchone()
+            return row is not None
+        except sqlite3.DatabaseError:
+            return False
+
+    def _prepare_crypto_backup_if_needed(self) -> Optional[Path]:
+        if self._crypto_backup_path is not None or not self._has_crypto_migration_pending():
+            return self._crypto_backup_path
+        self._crypto_backup_path = self.backup_database("before-crypto-migration")
+        return self._crypto_backup_path
+
     def setup_master_password(self, master_password: str) -> None:
         """首次设置主密码。"""
         self._begin_op("设置主密码")
@@ -157,18 +471,30 @@ class VaultStorage:
             iterations = KDF_ITERATIONS
             key = derive_sm4_key(master_password, salt, iterations)
             verifier = verifier_from_key(key, salt)
+            # 旧库首次设置主密码时，先备份原始数据，再进入同一事务写入
+            # 元数据和加密迁移；失败时 rollback 不会留下半初始化库。
+            self._prepare_crypto_backup_if_needed()
             # 元数据单事务提交，避免半初始化
             self._meta_set("kdf_salt", base64.b64encode(salt).decode("ascii"), commit=False)
             self._meta_set("kdf_iterations", str(iterations), commit=False)
             self._meta_set("password_verifier", verifier, commit=False)
             self._meta_set("crypto_algo", "SM3-KDF+SM4-CBC-MAC", commit=False)
             self._meta_set("crypto_version", "2", commit=False)
-            self._conn.commit()
 
             self._sm4_key = key
             self._account_cache.clear()
             self._migrate_legacy_if_needed()
             self._upgrade_gm1_to_gm2()
+            self._conn.commit()
+            self._finalize_legacy_key_move()
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+            self._sm4_key = None
+            self._account_cache.clear()
+            raise
         finally:
             self._end_op()
 
@@ -183,23 +509,99 @@ class VaultStorage:
             salt = base64.b64decode(salt_b64.encode("ascii"))
             self._sm4_key = unlock_with_password(master_password, salt, verifier, iterations)
             self._account_cache.clear()
+            self._prepare_crypto_backup_if_needed()
             self._migrate_legacy_if_needed()
             self._upgrade_gm1_to_gm2()
+            self._finalize_legacy_key_move()
+        except Exception:
+            self._sm4_key = None
+            self._account_cache.clear()
+            raise
+        finally:
+            self._end_op()
+
+    # ---------- 当前会话 PIN（仅用于自动锁定后的快速解锁） ----------
+    @classmethod
+    def validate_pin(cls, pin: str) -> None:
+        value = str(pin or "")
+        if not value.isascii() or not value.isdigit():
+            raise ValueError("PIN 必须只包含数字")
+        if not (cls.PIN_MIN_LEN <= len(value) <= cls.PIN_MAX_LEN):
+            raise ValueError(f"PIN 长度必须为 {cls.PIN_MIN_LEN}-{cls.PIN_MAX_LEN} 位")
+
+    def is_pin_configured(self) -> bool:
+        return bool(self._pin_salt and self._pin_verifier and self._pin_wrapped_key)
+
+    def set_session_pin(self, pin: str) -> None:
+        """设置当前进程有效的 PIN，并用 PIN 包装当前主密钥。
+
+        PIN 不写入数据库；包装值也只在内存中保留。这样自动锁定时可以清除
+        账户明文缓存，仍允许 PIN 恢复主密钥；程序退出后不会留下 PIN 后门。
+        """
+        self.validate_pin(pin)
+        self._begin_op("设置锁定 PIN", block=False)
+        try:
+            key = self._require_unlock()
+            salt = random_salt(16)
+            pin_key = derive_sm4_key(pin, salt, KDF_ITERATIONS)
+            self._pin_salt = salt
+            self._pin_verifier = verifier_from_key(pin_key, salt)
+            self._pin_wrapped_key = sm4_encrypt(base64.b64encode(key).decode("ascii"), pin_key)
+        finally:
+            self._end_op()
+
+    def clear_session_pin(self) -> None:
+        self._pin_salt = None
+        self._pin_verifier = None
+        self._pin_wrapped_key = None
+
+    def unlock_with_pin(self, pin: str) -> None:
+        """使用当前会话 PIN 恢复自动锁定前的主密钥。"""
+        self.validate_pin(pin)
+        self._begin_op("PIN 解锁", block=True)
+        try:
+            if not self.is_pin_configured():
+                raise ValueError("尚未设置锁定 PIN，请输入主密码")
+            salt = self._pin_salt
+            verifier = self._pin_verifier
+            wrapped = self._pin_wrapped_key
+            if salt is None or verifier is None or not wrapped:
+                raise ValueError("锁定 PIN 已失效，请输入主密码")
+            pin_key = derive_sm4_key(pin, salt, KDF_ITERATIONS)
+            if not secrets.compare_digest(verifier_from_key(pin_key, salt), verifier):
+                raise ValueError("PIN 错误")
+            try:
+                raw_key = base64.b64decode(
+                    sm4_decrypt(wrapped, pin_key).encode("ascii"), validate=True
+                )
+            except Exception as e:
+                raise ValueError("PIN 包装数据无效，请输入主密码") from e
+            if len(raw_key) != 16:
+                raise ValueError("PIN 包装数据无效，请输入主密码")
+            self._sm4_key = raw_key
+            self._account_cache.clear()
         finally:
             self._end_op()
 
     def backup_database(self, reason: str = "manual") -> Path:
         """复制当前数据库为备份文件，返回备份路径。"""
         self._conn.commit()
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        safe_reason = re.sub(r"[^\w\-]+", "_", reason)[:32] or "bak"
-        backup_path = self.db_path.with_name(f"{self.db_path.stem}.{safe_reason}.{ts}.bak")
+        backup_path = _new_backup_path(self.db_path, reason)
         # 使用 SQLite backup API，比直接 copy 更安全
-        dst = sqlite3.connect(str(backup_path))
+        dst: sqlite3.Connection | None = None
         try:
+            dst = sqlite3.connect(str(backup_path))
             self._conn.backup(dst)
+            dst.commit()
+        except Exception:
+            try:
+                backup_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         finally:
-            dst.close()
+            if dst is not None:
+                dst.close()
         return backup_path
 
     def change_master_password(self, old_password: str, new_password: str) -> Path:
@@ -275,6 +677,8 @@ class VaultStorage:
 
             self._sm4_key = new_key
             self._account_cache.clear()
+            # 主密钥已经改变，旧 PIN 包装值不可再用；下次需要重新设置 PIN。
+            self.clear_session_pin()
             return backup_path
         finally:
             self._end_op()
@@ -340,15 +744,39 @@ class VaultStorage:
         return value if not strict else value
 
     def _load_legacy_fernet_key(self) -> Optional[bytes]:
-        if not self.key_path.exists():
-            return None
+        for path in self._legacy_key_paths:
+            try:
+                if path.exists():
+                    return path.read_bytes().strip()
+            except OSError:
+                continue
+        return None
+
+    def _finalize_legacy_key_move(self) -> None:
+        """迁移事务成功后才移动旧版密钥；移动失败则保留原密钥。"""
+        key_path = self._find_legacy_key_path()
+        if key_path is None:
+            return
+        still_legacy = self._conn.execute(
+            "SELECT 1 FROM accounts WHERE "
+            "(password_enc != '' AND password_enc NOT LIKE 'GM1:%' AND password_enc NOT LIKE 'GM2:%') OR "
+            "(totp_secret_enc != '' AND totp_secret_enc NOT LIKE 'GM1:%' AND totp_secret_enc NOT LIKE 'GM2:%') OR "
+            "(notes != '' AND notes NOT LIKE 'GM1:%' AND notes NOT LIKE 'GM2:%') LIMIT 1"
+        ).fetchone()
+        if still_legacy:
+            return
+        bak = key_path.with_suffix(
+            key_path.suffix
+            + f".migrated.{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.bak"
+        )
         try:
-            return self.key_path.read_bytes().strip()
+            shutil.move(str(key_path), str(bak))
         except OSError:
-            return None
+            # 移动失败不要 unlink，仍保留旧版解密能力。
+            pass
 
     def _migrate_legacy_if_needed(self) -> None:
-        """把旧 Fernet 密文重加密为国密，仅当全部成功后才备份并移除 vault.key。"""
+        """把旧 Fernet/明文密文重加密为国密，失败时保留原字段和密钥。"""
         key = self._require_unlock()
         legacy = self._load_legacy_fernet_key()
         # 无旧密钥且抽样已是国密，直接跳过（加速启动）
@@ -370,113 +798,127 @@ class VaultStorage:
                 if not need:
                     return
 
-        rows = self._conn.execute(
-            "SELECT id, password_enc, totp_secret_enc, notes FROM accounts"
-        ).fetchall()
-        changed = False
-        failed_fields = 0
-        pending_legacy = 0
+        owns_transaction = not self._conn.in_transaction
+        if owns_transaction:
+            self._conn.execute("BEGIN")
+        try:
+            rows = self._conn.execute(
+                "SELECT id, password_enc, totp_secret_enc, notes FROM accounts"
+            ).fetchall()
+            changed = False
+            failed_fields = 0
 
-        for r in rows:
-            pid, pw, totp, notes = r["id"], r["password_enc"], r["totp_secret_enc"], r["notes"]
-            new_pw, new_totp, new_notes = pw, totp, notes
+            for r in rows:
+                pid, pw, totp, notes = r["id"], r["password_enc"], r["totp_secret_enc"], r["notes"]
+                new_pw, new_totp, new_notes = pw, totp, notes
 
-            if pw and not is_gm_cipher(pw):
-                pending_legacy += 1
-                plain = try_legacy_fernet_decrypt(pw, legacy) if legacy else None
-                if plain is not None:
-                    new_pw = sm4_encrypt(plain, key)
-                    changed = True
-                else:
-                    failed_fields += 1
-
-            if totp and not is_gm_cipher(totp):
-                pending_legacy += 1
-                plain = try_legacy_fernet_decrypt(totp, legacy) if legacy else None
-                if plain is not None:
-                    new_totp = sm4_encrypt(plain, key)
-                    changed = True
-                else:
-                    failed_fields += 1
-
-            # 备注：旧版明文，新版改为加密存储
-            if notes and not is_gm_cipher(notes):
-                if notes.startswith("gAAAA"):
-                    pending_legacy += 1
-                    plain = try_legacy_fernet_decrypt(notes, legacy) if legacy else None
-                    if plain is None:
-                        failed_fields += 1
-                        plain = None
-                    else:
-                        new_notes = sm4_encrypt(plain, key)
+                if pw and not is_gm_cipher(pw):
+                    plain = try_legacy_fernet_decrypt(pw, legacy) if legacy else None
+                    if plain is not None:
+                        new_pw = sm4_encrypt(plain, key)
                         changed = True
-                else:
-                    # 明文 notes 迁移不依赖 vault.key
-                    new_notes = sm4_encrypt(notes, key)
-                    changed = True
+                    else:
+                        failed_fields += 1
 
-            if (new_pw, new_totp, new_notes) != (pw, totp, notes):
-                self._conn.execute(
-                    "UPDATE accounts SET password_enc = ?, totp_secret_enc = ?, notes = ? WHERE id = ?",
-                    (new_pw, new_totp, new_notes, pid),
+                if totp and not is_gm_cipher(totp):
+                    plain = try_legacy_fernet_decrypt(totp, legacy) if legacy else None
+                    if plain is not None:
+                        new_totp = sm4_encrypt(plain, key)
+                        changed = True
+                    else:
+                        failed_fields += 1
+
+                # 备注：旧版明文，新版改为加密存储
+                if notes and not is_gm_cipher(notes):
+                    if notes.startswith("gAAAA"):
+                        plain = try_legacy_fernet_decrypt(notes, legacy) if legacy else None
+                        if plain is None:
+                            failed_fields += 1
+                        else:
+                            new_notes = sm4_encrypt(plain, key)
+                            changed = True
+                    else:
+                        # 明文 notes 迁移不依赖 vault.key
+                        new_notes = sm4_encrypt(notes, key)
+                        changed = True
+
+                if (new_pw, new_totp, new_notes) != (pw, totp, notes):
+                    self._conn.execute(
+                        "UPDATE accounts SET password_enc = ?, totp_secret_enc = ?, notes = ? WHERE id = ?",
+                        (new_pw, new_totp, new_notes, pid),
+                    )
+
+            if failed_fields:
+                # 不允许只迁移一部分字段：独立事务回滚后仍可用旧格式解密；
+                # 首次设置主密码的外层事务则直接抛错并回滚元数据。
+                if owns_transaction:
+                    self._conn.rollback()
+                    return
+                raise RuntimeError(
+                    "旧版密文迁移失败，数据库未改动；请检查旧版 vault.key 或使用备份恢复"
                 )
-
-        if changed:
-            self._conn.commit()
-
-        # 仅当：存在 vault.key，且没有任何 Fernet 字段仍解密失败时，才备份并移除密钥
-        if self.key_path.exists():
-            still_legacy = self._conn.execute(
-                "SELECT 1 FROM accounts WHERE "
-                "(password_enc LIKE 'gAAAA%') OR "
-                "(totp_secret_enc LIKE 'gAAAA%') OR "
-                "(notes LIKE 'gAAAA%') LIMIT 1"
-            ).fetchone()
-            if failed_fields == 0 and not still_legacy:
-                bak = self.key_path.with_suffix(
-                    self.key_path.suffix + f".migrated.{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak"
-                )
-                try:
-                    shutil.move(str(self.key_path), str(bak))
-                except OSError:
-                    # 移动失败则不要 unlink，保留访问能力
-                    pass
-            # 若仍有失败字段：保留 vault.key，绝不删除
+            if owns_transaction:
+                self._conn.commit()
+            # 成功提交后由外层统一移动 vault.key。
+        except Exception:
+            if owns_transaction:
+                self._conn.rollback()
+            raise
 
     def _upgrade_gm1_to_gm2(self) -> None:
         """将仍为 GM1 的字段升级为带 MAC 的 GM2（同密钥重封装）。"""
         key = self._require_unlock()
+        owns_transaction = not self._conn.in_transaction
+        if owns_transaction:
+            self._conn.execute("BEGIN")
         rows = self._conn.execute(
             "SELECT id, password_enc, totp_secret_enc, notes FROM accounts WHERE "
             "password_enc LIKE 'GM1:%' OR totp_secret_enc LIKE 'GM1:%' OR notes LIKE 'GM1:%'"
         ).fetchall()
         if not rows:
+            if owns_transaction:
+                self._conn.rollback()
             return
         changed = False
-        for r in rows:
-            pw, totp, notes = r["password_enc"], r["totp_secret_enc"], r["notes"]
-            new_pw, new_totp, new_notes = pw, totp, notes
-            try:
-                if is_gm1_cipher(pw or ""):
-                    new_pw = sm4_encrypt(sm4_decrypt(pw, key), key)
-                    changed = True
-                if is_gm1_cipher(totp or ""):
-                    new_totp = sm4_encrypt(sm4_decrypt(totp, key), key)
-                    changed = True
-                if is_gm1_cipher(notes or ""):
-                    new_notes = sm4_encrypt(sm4_decrypt(notes, key), key)
-                    changed = True
-            except CryptoError:
-                # 单条失败跳过，保留 GM1 以便排查
-                continue
-            if (new_pw, new_totp, new_notes) != (pw, totp, notes):
-                self._conn.execute(
-                    "UPDATE accounts SET password_enc = ?, totp_secret_enc = ?, notes = ? WHERE id = ?",
-                    (new_pw, new_totp, new_notes, r["id"]),
-                )
-        if changed:
-            self._conn.commit()
-            self._account_cache.clear()
+        try:
+            for r in rows:
+                pw, totp, notes = r["password_enc"], r["totp_secret_enc"], r["notes"]
+                new_pw, new_totp, new_notes = pw, totp, notes
+                try:
+                    if is_gm1_cipher(pw or ""):
+                        new_pw = sm4_encrypt(sm4_decrypt(pw, key), key)
+                        changed = True
+                    if is_gm1_cipher(totp or ""):
+                        new_totp = sm4_encrypt(sm4_decrypt(totp, key), key)
+                        changed = True
+                    if is_gm1_cipher(notes or ""):
+                        new_notes = sm4_encrypt(sm4_decrypt(notes, key), key)
+                        changed = True
+                except CryptoError:
+                    # GM1 仍可被当前读取逻辑兼容；放弃本次整批升级，
+                    # 不提交此前已生成的 GM2 更新。
+                    if owns_transaction:
+                        self._conn.rollback()
+                        self._account_cache.clear()
+                        return
+                    raise RuntimeError(
+                        f"GM1 密文升级失败（账户 {r['id']}），数据库未改动"
+                    )
+                if (new_pw, new_totp, new_notes) != (pw, totp, notes):
+                    self._conn.execute(
+                        "UPDATE accounts SET password_enc = ?, totp_secret_enc = ?, notes = ? WHERE id = ?",
+                        (new_pw, new_totp, new_notes, r["id"]),
+                    )
+            if owns_transaction:
+                if changed:
+                    self._conn.commit()
+                    self._account_cache.clear()
+                else:
+                    self._conn.rollback()
+        except Exception:
+            if owns_transaction:
+                self._conn.rollback()
+            raise
 
     def _now(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -490,7 +932,7 @@ class VaultStorage:
         row = self._conn.execute("SELECT COUNT(*) AS c FROM accounts").fetchone()
         return int(row["c"])
 
-    def _seed_default_sites(self) -> None:
+    def _seed_default_sites(self, *, commit: bool = True) -> None:
         defaults = [
             ("ChatGPT 对话", "https://chatgpt.com"),
             ("OpenAI 平台", "https://platform.openai.com"),
@@ -511,7 +953,8 @@ class VaultStorage:
                 "INSERT INTO sites (id, name, url, sort_order) VALUES (?, ?, ?, ?)",
                 (str(uuid.uuid4()), name, url, i),
             )
-        self._conn.commit()
+        if commit:
+            self._conn.commit()
 
     def should_seed_sample_account(self) -> bool:
         """是否应写入一次性示例账户（仅首次）。"""
@@ -814,6 +1257,7 @@ class VaultStorage:
         try:
             self._sm4_key = None
             self._account_cache.clear()
+            self.clear_session_pin()
             self._conn.close()
         finally:
             # 连接已关，仍释放锁标记

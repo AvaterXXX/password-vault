@@ -2,6 +2,7 @@
 """密码保险柜 — 本地账户密码 / 二次验证管理（白色界面 · 国密加密）。"""
 from __future__ import annotations
 
+import ctypes
 import re
 import sys
 import threading
@@ -19,7 +20,7 @@ from storage import VaultBusyError, VaultStorage
 
 # 安全相关默认值
 CLIPBOARD_CLEAR_MS = 45_000  # 复制密码/验证码后自动清空剪贴板
-IDLE_LOCK_MS = 5 * 60_000  # 空闲自动锁定
+IDLE_LOCK_MS = 15 * 60_000  # 空闲自动锁定（15 分钟）
 MIN_MASTER_PASSWORD_LEN = 8
 
 
@@ -46,6 +47,23 @@ def apply_window_icon(win: Any) -> None:
                 except Exception:
                     pass
             return
+
+
+def force_english_input(widget: Any) -> None:
+    """在 Windows 密码/PIN 输入框上关闭 IME，避免继承中文输入状态。"""
+    if sys.platform != "win32":
+        return
+    try:
+        imm32 = ctypes.WinDLL("imm32")
+        associate = imm32.ImmAssociateContext
+        associate.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        associate.restype = ctypes.c_void_p
+        # 关联空输入法上下文即可让该控件始终按英文/数字直输。
+        native = getattr(widget, "_entry", widget)
+        associate(ctypes.c_void_p(int(native.winfo_id())), ctypes.c_void_p(0))
+    except Exception:
+        # 非 Windows 兼容环境或极少数 Tk 实现没有 IME 句柄时不影响使用。
+        pass
 
 # ---- 白色主题 ----
 ctk.set_appearance_mode("light")
@@ -221,6 +239,15 @@ def pretty_confirm(master: Any, title: str, message: str) -> bool:
     """白色风格确认框，替代系统 messagebox。"""
     result = {"ok": False}
     dlg = ctk.CTkToplevel(master)
+    owner = getattr(master, "_vault_modal_owner", None)
+    if owner is None and hasattr(master, "_register_modal_window"):
+        owner = master
+    modal_entry = None
+    if owner is not None:
+        try:
+            modal_entry = owner._register_modal_window(dlg)
+        except Exception:
+            modal_entry = None
     dlg.title(title)
     dlg.geometry("380x200")
     dlg.resizable(False, False)
@@ -283,8 +310,191 @@ def pretty_confirm(master: Any, title: str, message: str) -> bool:
     ).pack(side="right")
 
     dlg.protocol("WM_DELETE_WINDOW", no)
-    master.wait_window(dlg)
+    try:
+        master.wait_window(dlg)
+    finally:
+        if owner is not None and modal_entry is not None:
+            try:
+                owner._modal_windows.remove(modal_entry)
+            except (ValueError, AttributeError):
+                pass
     return result["ok"]
+
+
+class PinSetupDialog(ctk.CTkToplevel):
+    """设置当前运行周期的自动锁定 PIN。"""
+
+    def __init__(self, master: Any, storage: VaultStorage) -> None:
+        super().__init__(master)
+        self.storage = storage
+        self.result_pin: str | None = None
+        self._busy = False
+        self._cancelled = False
+        self._submitted_pin = ""
+        self._set_result: tuple[str, str] | None = None
+        self.title("设置锁定 PIN")
+        self.geometry("440x350")
+        self.resizable(False, False)
+        self.configure(fg_color=BG)
+        self.transient(master)
+        register = getattr(master, "_register_modal_window", None)
+        if register is not None:
+            try:
+                register(self, cleanup=self.close_for_lock)
+            except Exception:
+                pass
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        apply_window_icon(self)
+
+        ctk.CTkLabel(
+            self,
+            text="设置自动锁定 PIN",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=TEXT,
+        ).pack(anchor="w", padx=28, pady=(24, 8))
+        ctk.CTkLabel(
+            self,
+            text=(
+                f"PIN 仅限 {storage.PIN_MIN_LEN}-{storage.PIN_MAX_LEN} 位数字。\n"
+                "它只保存在本次运行的内存中；程序重启后仍需输入主密码。"
+            ),
+            font=ctk.CTkFont(size=12),
+            text_color=TEXT_MUTED,
+            justify="left",
+            wraplength=380,
+        ).pack(anchor="w", padx=28, pady=(0, 14))
+
+        ctk.CTkLabel(self, text="新 PIN", text_color=TEXT_MUTED).pack(anchor="w", padx=28)
+        self.pin1 = ctk.CTkEntry(
+            self, show="•", height=36, fg_color=BG_SOFT, border_color=BORDER, text_color=TEXT
+        )
+        self.pin1.pack(fill="x", padx=28, pady=(4, 10))
+        ctk.CTkLabel(self, text="确认 PIN", text_color=TEXT_MUTED).pack(anchor="w", padx=28)
+        self.pin2 = ctk.CTkEntry(
+            self, show="•", height=36, fg_color=BG_SOFT, border_color=BORDER, text_color=TEXT
+        )
+        self.pin2.pack(fill="x", padx=28, pady=(4, 8))
+        self.pin1.bind("<Return>", lambda _e: self._submit())
+        self.pin2.bind("<Return>", lambda _e: self._submit())
+        self.pin1.bind("<FocusIn>", lambda _e: force_english_input(self.pin1), add="+")
+        self.pin2.bind("<FocusIn>", lambda _e: force_english_input(self.pin2), add="+")
+
+        self.err = ctk.CTkLabel(self, text="", text_color=DANGER)
+        self.err.pack(anchor="w", padx=28, pady=(0, 4))
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=28, pady=(6, 18))
+        ctk.CTkButton(
+            row,
+            text="保存 PIN",
+            height=38,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_HOVER,
+            command=self._submit,
+        ).pack(side="left", expand=True, fill="x", padx=(0, 8))
+        ctk.CTkButton(
+            row,
+            text="稍后设置",
+            width=100,
+            height=38,
+            fg_color="#E5E7EB",
+            hover_color="#D1D5DB",
+            text_color=TEXT,
+            command=self._cancel,
+        ).pack(side="right")
+
+        self.update_idletasks()
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            self.geometry(f"440x350+{(sw - 440) // 2}+{(sh - 350) // 2}")
+        except Exception:
+            pass
+        self.after(100, self._focus_pin)
+
+    def _focus_pin(self) -> None:
+        try:
+            self.focus_force()
+            self.pin1.focus_force()
+            force_english_input(self.pin1)
+        except Exception:
+            pass
+
+    def _cancel(self) -> None:
+        if self._busy:
+            return
+        self.result_pin = None
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+    def close_for_lock(self) -> None:
+        """自动锁定时安全关闭，即使 PIN 派生线程仍在后台。"""
+        self._cancelled = True
+        self.result_pin = None
+        try:
+            self.pin1.delete(0, "end")
+            self.pin2.delete(0, "end")
+        except Exception:
+            pass
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _submit(self) -> None:
+        if self._busy:
+            return
+        pin = self.pin1.get()
+        if pin != self.pin2.get():
+            self.err.configure(text="两次 PIN 不一致")
+            return
+        try:
+            self.storage.validate_pin(pin)
+        except Exception as e:
+            self.err.configure(text=str(e))
+            return
+        self._busy = True
+        self._submitted_pin = pin
+        self._set_result = None
+        self.err.configure(text="正在设置 PIN…", text_color=TEXT_MUTED)
+
+        def work() -> None:
+            try:
+                if self._cancelled:
+                    self._set_result = ("err", "")
+                    return
+                self.storage.set_session_pin(pin)
+                self._set_result = ("ok", "")
+            except Exception as e:
+                self._set_result = ("err", str(e) or "设置 PIN 失败")
+
+        threading.Thread(target=work, daemon=True).start()
+        self.after(80, self._poll_submit)
+
+    def _poll_submit(self) -> None:
+        if self._cancelled:
+            return
+        result = self._set_result
+        if result is None:
+            self.after(80, self._poll_submit)
+            return
+        self._busy = False
+        status, msg = result
+        if status != "ok":
+            self.err.configure(text=msg, text_color=DANGER)
+            return
+        self.result_pin = self._submitted_pin
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
 
 
 class UnlockDialog(ctk.CTkToplevel):
@@ -310,6 +520,9 @@ class UnlockDialog(ctk.CTkToplevel):
             if first
             else "数据已用国密 SM3/SM4-MAC 加密存储。\n请输入主密码解锁保险库。"
         )
+        discovery_note = getattr(storage, "database_discovery_note", None)
+        if discovery_note:
+            tip += f"\n\n数据库兼容提示：{discovery_note}"
 
         ctk.CTkLabel(
             self,
@@ -367,7 +580,19 @@ class UnlockDialog(ctk.CTkToplevel):
         ).pack(side="right")
 
         self._first = first
-        self.after(100, self.pw1.focus_set)
+        self.pw1.bind("<FocusIn>", lambda _e: force_english_input(self.pw1), add="+")
+        if self.pw2 is not None:
+            self.pw2.bind("<FocusIn>", lambda _e: force_english_input(self.pw2), add="+")
+
+        def focus_password() -> None:
+            try:
+                self.focus_force()
+                self.pw1.focus_force()
+                force_english_input(self.pw1)
+            except Exception:
+                pass
+
+        self.after(100, focus_password)
         self.update_idletasks()
         try:
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -531,12 +756,30 @@ class AccountVaultApp(ctk.CTk):
         self._clipboard_clear_after_id: str | None = None
         self._clipboard_expect: str | None = None
         self._idle_after_id: str | None = None
-        self._locked_overlay: ctk.CTkToplevel | None = None
+        self._locked_overlay: ctk.CTkFrame | None = None
+        self._locked_pin_entry: ctk.CTkEntry | None = None
+        self._locked_error_label: ctk.CTkLabel | None = None
+        self._locked_parent_bindings: list[tuple[str, str]] = []
+        self._pin_failed_attempts = 0
+        self._pin_lock_level = 0
+        self._pin_locked_until = 0.0
+        self._pin_countdown_after_id: str | None = None
+        self._locked_unlock_busy = False
+        self._locked_waiting_for_storage = False
+        self._locked_desc_label: ctk.CTkLabel | None = None
+        self._locked_unlock_button: ctk.CTkButton | None = None
+        self._locked_normal_desc_text = ""
+        self._lock_pending = False
+        self._pending_lock_after_id: str | None = None
+        # 所有由主窗口打开的模态窗口都登记在这里。自动锁定前会统一释放 grab、
+        # 清空输入并销毁，避免子窗口把输入焦点永远截走。
+        self._modal_windows: list[dict[str, Any]] = []
 
         self._build_ui()
         self._build_site_context_menu()
         # 延后首屏刷新，先显示窗口骨架，减少“卡住”感
         self.after(10, self._bootstrap_ui)
+        self.after(120, self._maybe_prompt_pin_setup)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # 空闲自动锁定：任意键鼠活动重置计时
         self.bind_all("<Any-KeyPress>", self._note_activity, add="+")
@@ -549,9 +792,110 @@ class AccountVaultApp(ctk.CTk):
         self.refresh_accounts()
         self._tick_totp()
         self._update_crypto_label()
+        self._update_pin_button_label()
+        discovery_note = getattr(self.storage, "database_discovery_note", None)
+        if discovery_note:
+            self.status_label.configure(text=f"数据库提示：{discovery_note}")
+
+    def _register_modal_window(
+        self, window: Any, cleanup: Any = None
+    ) -> dict[str, Any]:
+        """登记由主窗口创建的模态窗口，返回可补充 cleanup 的登记项。"""
+        entry: dict[str, Any] = {"window": window, "cleanup": cleanup}
+        self._modal_windows.append(entry)
+        try:
+            # 让传给 pretty_confirm 的子 Toplevel 也能找到主窗口登记器。
+            setattr(window, "_vault_modal_owner", self)
+
+            def on_destroy(event: Any) -> None:
+                event_widget = getattr(event, "widget", None)
+                try:
+                    is_window = event_widget is window or str(event_widget) == str(window)
+                except Exception:
+                    is_window = event_widget is window
+                if is_window:
+                    try:
+                        self._modal_windows.remove(entry)
+                    except ValueError:
+                        pass
+
+            window.bind("<Destroy>", on_destroy, add="+")
+        except Exception:
+            pass
+        return entry
+
+    def _clear_modal_widget(self, window: Any) -> None:
+        """递归清除弹窗中的 Entry/Textbox 明文。"""
+        try:
+            children = list(window.winfo_children())
+        except Exception:
+            return
+        for child in children:
+            try:
+                if isinstance(child, ctk.CTkEntry):
+                    child.delete(0, "end")
+                elif isinstance(child, ctk.CTkTextbox):
+                    child.delete("1.0", "end")
+            except Exception:
+                pass
+            self._clear_modal_widget(child)
+
+    def _close_registered_modals(self) -> None:
+        """关闭所有已登记弹窗，并确保 grab 不会阻塞锁定遮罩。"""
+        for entry in reversed(list(self._modal_windows)):
+            window = entry.get("window")
+            cleanup = entry.get("cleanup")
+            try:
+                if cleanup:
+                    cleanup()
+            except Exception:
+                pass
+            try:
+                self._clear_modal_widget(window)
+            except Exception:
+                pass
+            try:
+                window.grab_release()
+            except Exception:
+                pass
+            try:
+                window.destroy()
+            except Exception:
+                pass
+        self._modal_windows.clear()
+
+    def _maybe_prompt_pin_setup(self) -> None:
+        if self.storage.is_unlocked() and self._locked_overlay is None and not self.storage.is_pin_configured():
+            self._set_pin_dialog(initial=True)
+
+    def _update_pin_button_label(self) -> None:
+        try:
+            self._pin_button.configure(
+                text="修改锁定 PIN" if self.storage.is_pin_configured() else "设置锁定 PIN"
+            )
+        except Exception:
+            pass
+
+    def _set_pin_dialog(self, initial: bool = False) -> None:
+        if self._locked_overlay is not None or not self.storage.is_unlocked():
+            return
+        if self._import_running or self.storage.is_busy():
+            if not initial:
+                messagebox.showwarning(
+                    "请稍候",
+                    f"正在执行「{self.storage.busy_op() or '其他操作'}」，完成后再设置 PIN。",
+                )
+            return
+        dlg = PinSetupDialog(self, self.storage)
+        self.wait_window(dlg)
+        if dlg.result_pin:
+            self._update_pin_button_label()
+            self.status_label.configure(text="锁定 PIN 已设置（本次运行有效）")
+        elif initial:
+            self.status_label.configure(text="未设置 PIN，自动锁定时将要求主密码")
 
     def _note_activity(self, _event: Any = None) -> None:
-        if self.storage.is_unlocked():
+        if self.storage.is_unlocked() and not self._lock_pending:
             self._reset_idle_timer()
 
     def _reset_idle_timer(self) -> None:
@@ -561,64 +905,236 @@ class AccountVaultApp(ctk.CTk):
             except Exception:
                 pass
             self._idle_after_id = None
-        if self.storage.is_unlocked():
+        if self.storage.is_unlocked() and not self._lock_pending:
             self._idle_after_id = self.after(IDLE_LOCK_MS, self._idle_lock)
 
     def _idle_lock(self) -> None:
-        """空闲超时：锁定保险库并弹出重新解锁。"""
+        """空闲超时：先遮挡界面，再在忙操作结束后完成锁定。"""
         self._idle_after_id = None
-        if not self.storage.is_unlocked():
+        if not self.storage.is_unlocked() or self._lock_pending:
             return
         if self._import_running or self.storage.is_busy():
-            # 忙碌中推迟
-            self._reset_idle_timer()
+            # 不能在写事务持锁时直接清掉主密钥；先遮挡并销毁弹窗，事务完成后立即锁定。
+            self._lock_pending = True
+            self._prepare_lock_ui()
+            self._show_reunlock_dialog(waiting_for_storage=True)
+            self._schedule_pending_lock()
             return
+        self._prepare_lock_ui()
         try:
             self.storage.lock()
         except Exception:
             pass
         self._show_reunlock_dialog()
 
-    def _show_reunlock_dialog(self) -> None:
+    def _prepare_lock_ui(self) -> None:
+        """锁定前关闭弹窗、清空界面明文并清理剪贴板。"""
+        self._close_registered_modals()
+        try:
+            if hasattr(self, "site_popup"):
+                self.site_popup.close()
+        except Exception:
+            pass
+        self._clear_form_for_lock()
+        self._clear_clipboard_if_unchanged()
+
+    def _schedule_pending_lock(self) -> None:
+        if self._pending_lock_after_id is None:
+            self._pending_lock_after_id = self.after(250, self._complete_pending_lock)
+
+    def _complete_pending_lock(self) -> None:
+        self._pending_lock_after_id = None
+        if not self._lock_pending or self._locked_overlay is None:
+            return
+        if self._import_running or self.storage.is_busy():
+            self._schedule_pending_lock()
+            return
+        try:
+            self.storage.lock()
+        except Exception:
+            self._schedule_pending_lock()
+            return
+        self._lock_pending = False
+        self._locked_waiting_for_storage = False
+        if self._locked_desc_label is not None:
+            try:
+                self._locked_desc_label.configure(text=self._locked_normal_desc_text)
+            except Exception:
+                pass
+        if self._locked_pin_entry is not None:
+            try:
+                self._locked_pin_entry.configure(state="normal")
+                self._locked_pin_entry.focus_force()
+                force_english_input(self._locked_pin_entry)
+            except Exception:
+                pass
+        if self._locked_unlock_button is not None:
+            try:
+                self._locked_unlock_button.configure(state="normal")
+            except Exception:
+                pass
+
+    def _clear_form_for_lock(self) -> None:
+        """锁定前清空控件中的明文，避免遮罩失效时仍能看到敏感字段。"""
+        if not hasattr(self, "fields"):
+            return
+        self._filling_form = True
+        try:
+            for key in ("title", "username", "password", "totp_secret", "website", "notes"):
+                self._entry_set(key, "")
+            self._entry_set("category", "其他")
+            self._show_password = False
+            pw = self.fields.get("password")
+            if isinstance(pw, ctk.CTkEntry):
+                pw.configure(show="•")
+        finally:
+            self._filling_form = False
+        self._last_totp_ui = ("", "")
+        self._refresh_totp_display()
+
+    def _release_locked_bindings(self) -> None:
+        for sequence, func_id in self._locked_parent_bindings:
+            try:
+                self.unbind(sequence, func_id)
+            except Exception:
+                pass
+        self._locked_parent_bindings.clear()
+
+    def _format_pin_lock_time(self, seconds: int) -> str:
+        seconds = max(int(seconds), 0)
+        minutes, rem = divmod(seconds, 60)
+        if minutes:
+            return f"{minutes} 分钟 {rem} 秒" if rem else f"{minutes} 分钟"
+        return f"{seconds} 秒"
+
+    def _show_reunlock_dialog(self, *, waiting_for_storage: bool = False) -> None:
         if self._locked_overlay is not None:
             return
-        dlg = ctk.CTkToplevel(self)
-        self._locked_overlay = dlg
-        dlg.title("已自动锁定")
-        dlg.geometry("400x260")
-        dlg.configure(fg_color=BG)
-        dlg.transient(self)
-        dlg.grab_set()
-        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # 必须解锁
-        apply_window_icon(dlg)
+        self._locked_waiting_for_storage = waiting_for_storage
+        cover = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
+        cover.place(relx=0, rely=0, relwidth=1, relheight=1)
+        cover.lift()
+        self._locked_overlay = cover
 
+        pin_mode = self.storage.is_pin_configured()
+        card = ctk.CTkFrame(
+            cover,
+            width=500,
+            height=330,
+            fg_color=BG,
+            corner_radius=14,
+            border_width=1,
+            border_color=BORDER,
+        )
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        card.pack_propagate(False)
         ctk.CTkLabel(
-            dlg,
+            card,
             text="保险库已锁定",
             font=ctk.CTkFont(size=18, weight="bold"),
             text_color=TEXT,
-        ).pack(anchor="w", padx=24, pady=(22, 6))
-        ctk.CTkLabel(
-            dlg,
-            text="因空闲超时，敏感数据已从内存清除。\n请重新输入主密码继续。",
+        ).pack(anchor="w", padx=28, pady=(26, 6))
+        normal_desc = (
+            "因空闲超时，主界面已完全遮挡，敏感数据已从内存缓存清除。\n"
+            + ("请输入锁定 PIN 继续。" if pin_mode else "尚未设置锁定 PIN，请输入主密码继续。")
+        )
+        self._locked_normal_desc_text = normal_desc
+        desc_label = ctk.CTkLabel(
+            card,
+            text=("正在完成当前操作，主界面已遮挡；完成后即可输入解锁凭据。" if waiting_for_storage else normal_desc),
             text_color=TEXT_MUTED,
             justify="left",
-        ).pack(anchor="w", padx=24, pady=(0, 12))
-        ctk.CTkLabel(dlg, text="主密码", text_color=TEXT_MUTED).pack(anchor="w", padx=24)
-        pw = ctk.CTkEntry(dlg, show="•", height=34, fg_color=BG_SOFT, border_color=BORDER)
-        pw.pack(fill="x", padx=24, pady=(4, 8))
-        err = ctk.CTkLabel(dlg, text="", text_color=DANGER)
-        err.pack(anchor="w", padx=24)
+            wraplength=440,
+        )
+        desc_label.pack(anchor="w", padx=28, pady=(0, 14))
+        self._locked_desc_label = desc_label
+        ctk.CTkLabel(card, text="锁定 PIN" if pin_mode else "主密码", text_color=TEXT_MUTED).pack(
+            anchor="w", padx=28
+        )
+        pw = ctk.CTkEntry(
+            card,
+            show="•",
+            height=36,
+            fg_color=BG_SOFT,
+            border_color=BORDER,
+            text_color=TEXT,
+        )
+        pw.pack(fill="x", padx=28, pady=(4, 8))
+        err = ctk.CTkLabel(card, text="", text_color=DANGER, wraplength=440, justify="left")
+        err.pack(anchor="w", padx=28)
+        unlock_btn = ctk.CTkButton(
+            card,
+            text="解锁",
+            height=38,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_HOVER,
+            state="disabled" if waiting_for_storage else "normal",
+        )
+        unlock_btn.pack(fill="x", padx=28, pady=(14, 18))
+        self._locked_pin_entry = pw
+        self._locked_error_label = err
+        self._locked_unlock_button = unlock_btn
+        if waiting_for_storage:
+            pw.configure(state="disabled")
+        focus_guard = {"active": False}
 
-        def do_unlock() -> None:
-            try:
-                self.storage.unlock(pw.get())
-            except Exception as e:
-                err.configure(text=str(e))
+        def bring_front(_event: Any = None) -> None:
+            if self._locked_overlay is not cover:
                 return
+            if _event is not None and getattr(_event, "widget", None) is not self:
+                return
+            if focus_guard["active"]:
+                return
+            focus_guard["active"] = True
+            try:
+                cover.lift()
+                self.lift()
+                self.focus_force()
+                pw.focus_force()
+                force_english_input(pw)
+            except Exception:
+                pass
+            finally:
+                focus_guard["active"] = False
+
+        # 监听窗口重新映射和主窗口自身重新获得焦点；忽略子控件的 FocusIn，
+        # 避免聚焦 entry 时再次触发置顶回调。
+        for sequence in ("<Map>", "<FocusIn>"):
+            try:
+                binding = self.bind(sequence, bring_front, add="+")
+                self._locked_parent_bindings.append((sequence, binding))
+            except Exception:
+                pass
+        cover.bind("<Map>", bring_front, add="+")
+
+        def close_overlay() -> None:
+            if self._pending_lock_after_id is not None:
+                try:
+                    self.after_cancel(self._pending_lock_after_id)
+                except Exception:
+                    pass
+                self._pending_lock_after_id = None
+            if self._pin_countdown_after_id is not None:
+                try:
+                    self.after_cancel(self._pin_countdown_after_id)
+                except Exception:
+                    pass
+                self._pin_countdown_after_id = None
+            self._release_locked_bindings()
+            self._locked_pin_entry = None
+            self._locked_error_label = None
+            self._locked_desc_label = None
+            self._locked_unlock_button = None
+            self._locked_normal_desc_text = ""
+            self._locked_waiting_for_storage = False
+            self._lock_pending = False
             self._locked_overlay = None
             try:
-                dlg.destroy()
+                pw.delete(0, "end")
+            except Exception:
+                pass
+            try:
+                cover.destroy()
             except Exception:
                 pass
             self._update_crypto_label()
@@ -629,11 +1145,96 @@ class AccountVaultApp(ctk.CTk):
             self._reset_idle_timer()
             self.status_label.configure(text="已重新解锁")
 
+        def update_lockout_message(from_timer: bool = False) -> None:
+            if self._locked_overlay is not cover:
+                return
+            if not from_timer and self._pin_countdown_after_id is not None:
+                return
+            if from_timer:
+                self._pin_countdown_after_id = None
+            remain = int(max(0.0, self._pin_locked_until - time.monotonic()) + 0.999)
+            if remain <= 0:
+                err.configure(text="可以重新输入 PIN", text_color=TEXT_MUTED)
+                return
+            err.configure(
+                text=f"PIN 错误次数过多，暂时锁定。请等待 {self._format_pin_lock_time(remain)}。",
+                text_color=DANGER,
+            )
+            self._pin_countdown_after_id = self.after(1000, lambda: update_lockout_message(True))
+
+        def record_pin_failure(message: str) -> None:
+            self._pin_failed_attempts += 1
+            if self._pin_failed_attempts < 5:
+                left = 5 - self._pin_failed_attempts
+                err.configure(text=f"{message}\n连续错误 {self._pin_failed_attempts} 次，还可尝试 {left} 次。")
+                return
+            self._pin_failed_attempts = 0
+            self._pin_lock_level += 1
+            lock_minutes = min(10 * (2 ** (self._pin_lock_level - 1)), 24 * 60)
+            self._pin_locked_until = time.monotonic() + lock_minutes * 60
+            update_lockout_message()
+
+        def poll_unlock(result_box: dict[str, tuple[str, str] | None]) -> None:
+            if self._locked_overlay is not cover:
+                return
+            result = result_box.get("result")
+            if result is None:
+                self.after(60, lambda: poll_unlock(result_box))
+                return
+            self._locked_unlock_busy = False
+            try:
+                pw.configure(state="normal")
+            except Exception:
+                pass
+            unlock_btn.configure(state="normal")
+            status, msg = result
+            if status != "ok":
+                if pin_mode:
+                    record_pin_failure(msg or "PIN 错误")
+                else:
+                    err.configure(text=msg or "主密码错误或解锁失败", text_color=DANGER)
+                bring_front()
+                return
+            self._pin_failed_attempts = 0
+            self._pin_lock_level = 0
+            self._pin_locked_until = 0.0
+            close_overlay()
+
+        def do_unlock() -> None:
+            if getattr(self, "_locked_unlock_busy", False):
+                return
+            if self._locked_waiting_for_storage or self._lock_pending:
+                return
+            if pin_mode and time.monotonic() < self._pin_locked_until:
+                update_lockout_message()
+                return
+            value = pw.get()
+            if not value:
+                err.configure(text="请输入内容", text_color=DANGER)
+                return
+            self._locked_unlock_busy = True
+            pw.configure(state="disabled")
+            unlock_btn.configure(state="disabled")
+            err.configure(text="正在解锁，请稍候…", text_color=TEXT_MUTED)
+            result_box: dict[str, tuple[str, str] | None] = {"result": None}
+
+            def work() -> None:
+                try:
+                    if pin_mode:
+                        self.storage.unlock_with_pin(value)
+                    else:
+                        self.storage.unlock(value)
+                    result_box["result"] = ("ok", "")
+                except Exception as e:
+                    result_box["result"] = ("err", str(e) or "解锁失败")
+
+            threading.Thread(target=work, daemon=True).start()
+            self.after(60, lambda: poll_unlock(result_box))
+
+        unlock_btn.configure(command=do_unlock)
         pw.bind("<Return>", lambda _e: do_unlock())
-        ctk.CTkButton(
-            dlg, text="解锁", fg_color=PRIMARY, hover_color=PRIMARY_HOVER, command=do_unlock
-        ).pack(pady=14)
-        self.after(100, pw.focus_set)
+        pw.bind("<FocusIn>", lambda _e: force_english_input(pw), add="+")
+        self.after(100, bring_front)
 
     def _copy_sensitive(self, value: str, label: str) -> None:
         """复制敏感内容，并在超时后尝试清空剪贴板。"""
@@ -723,6 +1324,18 @@ class AccountVaultApp(ctk.CTk):
             command=self._import_dialog,
         ).grid(row=0, column=2, sticky="e", padx=(0, 8))
 
+        self._pin_button = ctk.CTkButton(
+            top,
+            text="设置锁定 PIN",
+            width=110,
+            height=36,
+            fg_color="#EEF2FF",
+            hover_color="#DBEAFE",
+            text_color=PRIMARY,
+            command=self._set_pin_dialog,
+        )
+        self._pin_button.grid(row=0, column=3, sticky="e", padx=(0, 8))
+
         ctk.CTkButton(
             top,
             text="修改主密码",
@@ -732,7 +1345,7 @@ class AccountVaultApp(ctk.CTk):
             hover_color="#D1D5DB",
             text_color=TEXT,
             command=self._change_master_password_dialog,
-        ).grid(row=0, column=3, sticky="e", padx=(0, 8))
+        ).grid(row=0, column=4, sticky="e", padx=(0, 8))
 
         ctk.CTkButton(
             top,
@@ -742,7 +1355,7 @@ class AccountVaultApp(ctk.CTk):
             fg_color=PRIMARY,
             hover_color=PRIMARY_HOVER,
             command=self._new_account,
-        ).grid(row=0, column=4, sticky="e")
+        ).grid(row=0, column=5, sticky="e")
 
         # ---- 左：账户列表 ----
         left = ctk.CTkFrame(root, fg_color=BG_SOFT, corner_radius=12, border_width=1, border_color=BORDER)
@@ -837,6 +1450,9 @@ class AccountVaultApp(ctk.CTk):
                     height=34,
                 )
                 widget.grid(row=0, column=0, sticky="ew")
+                widget.bind(
+                    "<FocusIn>", lambda _e, entry=widget: force_english_input(entry), add="+"
+                )
                 ctk.CTkButton(
                     pw_frame,
                     text="显示",
@@ -870,6 +1486,9 @@ class AccountVaultApp(ctk.CTk):
                     placeholder_text="粘贴密钥后下方自动显示验证码",
                 )
                 widget.grid(row=0, column=0, sticky="ew")
+                widget.bind(
+                    "<FocusIn>", lambda _e, entry=widget: force_english_input(entry), add="+"
+                )
                 widget.bind("<KeyRelease>", lambda _e: self._refresh_totp_display())
                 widget.bind("<<Paste>>", lambda _e: self.after(10, self._refresh_totp_display))
                 widget.bind("<FocusOut>", lambda _e: self._refresh_totp_display())
@@ -1444,6 +2063,7 @@ class AccountVaultApp(ctk.CTk):
     # ---------------- 网站弹窗 ----------------
     def _add_site_dialog(self) -> None:
         dlg = ctk.CTkToplevel(self)
+        modal_entry = self._register_modal_window(dlg)
         dlg.title("添加常用网站")
         dlg.geometry("380x220")
         dlg.configure(fg_color=BG)
@@ -1464,6 +2084,24 @@ class AccountVaultApp(ctk.CTk):
         )
         url_e.pack(fill="x", padx=20)
 
+        def close_dialog() -> None:
+            try:
+                name_e.delete(0, "end")
+                url_e.delete(0, "end")
+            except Exception:
+                pass
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        modal_entry["cleanup"] = close_dialog
+        dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+
         def save() -> None:
             name, url = name_e.get().strip(), url_e.get().strip()
             if not name or not url:
@@ -1471,7 +2109,7 @@ class AccountVaultApp(ctk.CTk):
                 return
             self.storage.add_site(name, normalize_url(url))
             self.refresh_sites()
-            dlg.destroy()
+            close_dialog()
             self.status_label.configure(text=f"已添加网站：{name}")
 
         ctk.CTkButton(dlg, text="保存", fg_color=PRIMARY, hover_color=PRIMARY_HOVER, command=save).pack(pady=18)
@@ -1489,6 +2127,7 @@ class AccountVaultApp(ctk.CTk):
             return
 
         dlg = ctk.CTkToplevel(self)
+        modal_entry = self._register_modal_window(dlg)
         dlg.title("批量导入账户")
         dlg.geometry("820x640")
         dlg.configure(fg_color=BG)
@@ -1497,11 +2136,31 @@ class AccountVaultApp(ctk.CTk):
         apply_window_icon(dlg)
         import_active = {"running": False}
 
+        def close_dialog() -> None:
+            import_active["cancelled"] = True
+            if import_active.get("running") and self._lock_pending:
+                # 自动锁定已用遮罩接管界面；让后台写事务自行结束，随后立即锁库。
+                self._import_running = False
+            try:
+                self._clear_modal_widget(dlg)
+            except Exception:
+                pass
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        modal_entry["cleanup"] = close_dialog
+
         def try_close() -> None:
             if import_active["running"]:
                 messagebox.showwarning("导入进行中", "请等待导入完成后再关闭。", parent=dlg)
                 return
-            dlg.destroy()
+            close_dialog()
 
         dlg.protocol("WM_DELETE_WINDOW", try_close)
 
@@ -1680,6 +2339,8 @@ class AccountVaultApp(ctk.CTk):
                 import_state["done"] = True
 
             def poll() -> None:
+                if import_active.get("cancelled"):
+                    return
                 if not import_state.get("done"):
                     dlg.after(50, poll)
                     return
@@ -1730,6 +2391,7 @@ class AccountVaultApp(ctk.CTk):
             return
 
         dlg = ctk.CTkToplevel(self)
+        modal_entry = self._register_modal_window(dlg)
         dlg.title("修改主密码")
         dlg.geometry("420x380")
         dlg.configure(fg_color=BG)
@@ -1751,6 +2413,7 @@ class AccountVaultApp(ctk.CTk):
             ctk.CTkLabel(dlg, text=label, text_color=TEXT_MUTED).pack(anchor="w", padx=20)
             e = ctk.CTkEntry(dlg, show="•", height=34, fg_color=BG_SOFT, border_color=BORDER)
             e.pack(fill="x", padx=20, pady=(2, 8))
+            e.bind("<FocusIn>", lambda _e, entry=e: force_english_input(entry), add="+")
             return e
 
         old_e = labeled_entry("原主密码")
@@ -1758,6 +2421,33 @@ class AccountVaultApp(ctk.CTk):
         new2_e = labeled_entry("确认新主密码")
         err = ctk.CTkLabel(dlg, text="", text_color=DANGER, wraplength=360, justify="left")
         err.pack(anchor="w", padx=20)
+
+        def close_dialog() -> None:
+            for entry in (old_e, new_e, new2_e):
+                try:
+                    entry.delete(0, "end")
+                except Exception:
+                    pass
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        modal_entry["cleanup"] = close_dialog
+        dlg.protocol("WM_DELETE_WINDOW", close_dialog)
+
+        def focus_old_password() -> None:
+            try:
+                old_e.focus_force()
+                force_english_input(old_e)
+            except Exception:
+                pass
+
+        dlg.after(100, focus_old_password)
 
         def ok() -> None:
             if self._import_running or self.storage.is_busy():
@@ -1778,19 +2468,24 @@ class AccountVaultApp(ctk.CTk):
                 err.configure(text=str(e))
                 return
             self._update_crypto_label()
-            self.status_label.configure(text="主密码已修改，数据已重新加密")
+            self._update_pin_button_label()
+            self.status_label.configure(text="主密码已修改；锁定 PIN 需要重新设置")
             messagebox.showinfo(
                 "成功",
-                f"主密码已修改。\n备份文件：\n{bak}",
+                f"主密码已修改。\n锁定 PIN 已清除，请重新设置。\n备份文件：\n{bak}",
                 parent=dlg,
             )
-            dlg.destroy()
+            close_dialog()
+            self.after(120, self._set_pin_dialog)
 
         ctk.CTkButton(dlg, text="确认修改", fg_color=PRIMARY, hover_color=PRIMARY_HOVER, command=ok).pack(
             pady=14
         )
 
     def _on_close(self) -> None:
+        if getattr(self, "_locked_unlock_busy", False):
+            messagebox.showwarning("正在解锁", "请等待解锁完成后再退出。")
+            return
         if self._import_running or self.storage.is_busy():
             if not messagebox.askyesno(
                 "操作进行中",
@@ -1802,6 +2497,20 @@ class AccountVaultApp(ctk.CTk):
                 self.after_cancel(self._idle_after_id)
         except Exception:
             pass
+        try:
+            if self._pin_countdown_after_id is not None:
+                self.after_cancel(self._pin_countdown_after_id)
+        except Exception:
+            pass
+        try:
+            if self._pending_lock_after_id is not None:
+                self.after_cancel(self._pending_lock_after_id)
+        except Exception:
+            pass
+        self._pending_lock_after_id = None
+        self._lock_pending = False
+        self._close_registered_modals()
+        self._release_locked_bindings()
         try:
             if hasattr(self, "site_popup"):
                 self.site_popup.close()
